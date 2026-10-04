@@ -838,7 +838,8 @@ impl WorkspaceSessionHandle {
   async fn can_write_collab(&self, store: &Arc<CollabManager>, object_id: &ObjectId) -> bool {
     let now = Instant::now();
     if let Some((permission, cached_at)) = self.permission_cache.read().await.get(object_id) {
-      if now.duration_since(*cached_at) < self.cache_ttl {
+      // A successful read check only establishes read access. Resolve write access separately.
+      if now.duration_since(*cached_at) < self.cache_ttl && *permission != PermissionType::Read {
         return permission.can_write();
       }
     }
