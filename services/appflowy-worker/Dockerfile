@@ -46,6 +46,8 @@ RUN if [ "$PROFILE" = "debug" ]; then \
 
 FROM ${RUNTIME_IMAGE} AS runtime
 WORKDIR /app/services/appflowy-worker
+# Bootstrap HTTPS package verification from the pinned build image.
+COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
   && apt-get update -y \
     && apt-get install -y --no-install-recommends openssl \
