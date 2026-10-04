@@ -52,6 +52,7 @@ WORKDIR /app/services/appflowy-worker
 COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
   && apt-get update -y \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends openssl \
     && apt-get install -y -y ca-certificates \
     # Clean up
