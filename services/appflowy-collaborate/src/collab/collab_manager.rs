@@ -243,6 +243,7 @@ impl CollabManager {
     sender: &CollabOrigin,
     update: Vec<u8>,
   ) -> anyhow::Result<Rid> {
+    Update::decode_v1(&update).map_err(|err| AppError::DecodeUpdateError(err.to_string()))?;
     trace!(
       "publish_update({:?}, {}/{}, update: {:#?})",
       workspace_id,
@@ -470,7 +471,7 @@ impl CollabManager {
       .install(|| {
         snapshot_tasks
           .into_par_iter()
-          .filter_map(|task| {
+          .map(|task| {
             match apply_updates_to_snapshot(
               client_id,
               task.object_id,
@@ -479,7 +480,7 @@ impl CollabManager {
               task.update_snapshot,
               task.updates,
             ) {
-              Ok((rid, full_state, state_vector, paragraphs)) => Some(ProcessedSnapshot {
+              Ok((rid, full_state, state_vector, paragraphs)) => Ok(ProcessedSnapshot {
                 workspace_id: task.workspace_id,
                 object_id: task.object_id,
                 collab_type: task.collab_type,
@@ -494,13 +495,13 @@ impl CollabManager {
                   "Failed to process collab {} snapshot: {}",
                   task.object_id, err
                 );
-                None
+                Err(err)
               },
             }
           })
-          .collect::<Vec<_>>()
+          .collect::<anyhow::Result<Vec<_>>>()
       })
-      .map_err(|err| anyhow!("Thread pool panic during snapshot processing: {}", err))
+      .map_err(|err| anyhow!("Thread pool panic during snapshot processing: {}", err))?
   }
 
   /// Encodes collabs in parallel and saves them in batches grouped by user ID
@@ -529,7 +530,7 @@ impl CollabManager {
       // Batch insert snapshots for each user
       self
         .batch_insert_by_user(workspace_id, encoded_result.params_by_uid)
-        .await;
+        .await?;
 
       // Batch index collabs periodically
       if !indexed_collabs.is_empty() {
@@ -622,28 +623,24 @@ impl CollabManager {
     &self,
     workspace_id: WorkspaceId,
     batch_params_by_uid: HashMap<i64, Vec<CollabParams>>,
-  ) {
+  ) -> anyhow::Result<()> {
     for (uid, batch_params) in batch_params_by_uid {
       if !batch_params.is_empty() {
         let batch_len = batch_params.len();
-        if let Err(err) = self
+        let written = self
           .collab_cache
           .bulk_insert_collab(workspace_id, &uid, batch_params)
-          .await
-        {
-          warn!(
-            "Failed to batch insert {} snapshots for user {}: {}",
-            batch_len, uid, err
-          );
-        } else {
-          trace!(
-            "Successfully batch inserted {} snapshots for user {}",
-            batch_len,
-            uid
-          );
+          .await?;
+        if written.len() != batch_len {
+          return Err(anyhow!(
+            "Snapshot batch persisted only {} of {} objects",
+            written.len(),
+            batch_len
+          ));
         }
       }
     }
+    Ok(())
   }
 
   /// Batch indexes collabs for search
@@ -717,6 +714,12 @@ fn apply_updates_to_snapshot(
     drop(tx); // commit the transaction
   }
   let tx = collab.transact();
+  if tx.store().pending_update().is_some() || tx.store().pending_ds().is_some() {
+    return Err(anyhow!(
+      "Snapshot {} has updates with missing dependencies",
+      object_id
+    ));
+  }
   let full_state = tx.encode_diff_v1(&StateVector::default());
   let state_vector = tx.state_vector();
   let paragraphs = if collab_type == CollabType::Document {
@@ -775,4 +778,67 @@ struct EncodedChunkResult {
   params_by_uid: HashMap<i64, Vec<CollabParams>>,
   /// Indexing tasks for search engine updates
   indexing_tasks: Vec<UnindexedCollabTask>,
+}
+
+#[cfg(test)]
+mod snapshot_integrity_tests {
+  use super::*;
+  use yrs::{Doc, Text, Transact};
+
+  fn message(object_id: Uuid, update: Vec<u8>, timestamp: u64) -> UpdateStreamMessage {
+    UpdateStreamMessage {
+      object_id,
+      update: update.into(),
+      last_message_id: Rid::new(timestamp, 0),
+      collab_type: CollabType::Document,
+      sender: CollabOrigin::Server,
+      update_flags: UpdateFlags::Lib0v1,
+    }
+  }
+
+  #[test]
+  fn incomplete_dependencies_prevent_snapshot_and_can_be_replayed_in_order() {
+    let oid = Uuid::new_v4();
+    let doc = Doc::with_client_id(42);
+    let text = doc.get_or_insert_text("content");
+    text.insert(&mut doc.transact_mut(), 0, "first");
+    let first = doc
+      .transact()
+      .encode_state_as_update_v1(&StateVector::default());
+    let vector = doc.transact().state_vector();
+    text.insert(&mut doc.transact_mut(), 5, " second");
+    let second = doc.transact().encode_state_as_update_v1(&vector);
+    assert!(apply_updates_to_snapshot(
+      99,
+      oid,
+      CollabType::Document,
+      Rid::default(),
+      Bytes::from_static(&[0, 0]),
+      vec![message(oid, second.clone(), 1)]
+    )
+    .is_err());
+    assert!(apply_updates_to_snapshot(
+      99,
+      oid,
+      CollabType::Document,
+      Rid::default(),
+      Bytes::from_static(&[0, 0]),
+      vec![message(oid, second, 1), message(oid, first, 2)]
+    )
+    .is_ok());
+  }
+
+  #[test]
+  fn malformed_update_prevents_snapshot() {
+    let oid = Uuid::new_v4();
+    assert!(apply_updates_to_snapshot(
+      99,
+      oid,
+      CollabType::Document,
+      Rid::default(),
+      Bytes::from_static(&[0, 0]),
+      vec![message(oid, vec![255, 255], 1)]
+    )
+    .is_err());
+  }
 }

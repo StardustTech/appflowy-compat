@@ -483,26 +483,36 @@ impl StreamHandler<(ObjectId, Arc<AwarenessStreamUpdate>)> for Workspace {
   fn handle(
     &mut self,
     (object_id, msg): (ObjectId, Arc<AwarenessStreamUpdate>),
-    _: &mut Self::Context,
+    ctx: &mut Self::Context,
   ) {
     tracing::trace!(
       "received awareness update for {}/{}",
       self.workspace_id,
       object_id
     );
-    for (session_id, sender) in self.sessions_by_client_id.iter() {
-      if sender.collab_origin == msg.sender {
-        continue; // skip the sender
+    let sessions: Vec<_> = self
+      .sessions_by_client_id
+      .values()
+      .filter(|s| s.collab_origin != msg.sender)
+      .cloned()
+      .collect();
+    let store = self.manager.clone();
+    ctx.spawn(
+      async move {
+        for session in sessions {
+          if session.can_read_collab(&store, &object_id).await {
+            session.conn.do_send(WsOutput {
+              message: ServerMessage::AwarenessUpdate {
+                object_id,
+                collab_type: CollabType::Unknown,
+                awareness: msg.data.encode_v1().into(),
+              },
+            });
+          }
+        }
       }
-      tracing::trace!("sending awareness update to {}", session_id);
-      sender.conn.do_send(WsOutput {
-        message: ServerMessage::AwarenessUpdate {
-          object_id,
-          collab_type: CollabType::Unknown,
-          awareness: msg.data.encode_v1().into(),
-        },
-      });
-    }
+      .into_actor(self),
+    );
   }
 }
 
@@ -639,14 +649,12 @@ impl Handler<Snapshot> for Workspace {
     Box::pin(
       async move { store.snapshot_workspace(workspace_id, up_to).await }
         .into_actor(self)
-        .map(move |res, act, ctx| match res {
-          Ok(_) => {
-            tracing::trace!("workspace {} snapshot complete", workspace_id);
-            act.snapshot_handle = Some(ctx.notify_later(Snapshot, Self::SNAPSHOT_INTERVAL));
-          },
-          Err(err) => {
-            tracing::error!("failed to snapshot workspace {}: {}", workspace_id, err)
-          },
+        .map(move |res, act, ctx| {
+          match res {
+            Ok(_) => tracing::trace!("workspace {} snapshot complete", workspace_id),
+            Err(err) => tracing::error!("failed to snapshot workspace {}: {}", workspace_id, err),
+          }
+          act.snapshot_handle = Some(ctx.notify_later(Snapshot, Self::SNAPSHOT_INTERVAL));
         }),
     )
   }
@@ -837,14 +845,8 @@ impl WorkspaceSessionHandle {
   /// Returns true if the session's user is allowed to write the collab.
   async fn can_write_collab(&self, store: &Arc<CollabManager>, object_id: &ObjectId) -> bool {
     let now = Instant::now();
-    if let Some((permission, cached_at)) = self.permission_cache.read().await.get(object_id) {
-      // A successful read check only establishes read access. Resolve write access separately.
-      if now.duration_since(*cached_at) < self.cache_ttl && *permission != PermissionType::Read {
-        return permission.can_write();
-      }
-    }
 
-    // Cache miss or expired, check permission and update cache
+    // Authorize each operation against current workspace membership, including existing sessions.
     let has_permission = store
       .enforce_write_collab(&self.workspace_id, &self.uid, object_id)
       .await
@@ -876,11 +878,6 @@ impl WorkspaceSessionHandle {
   /// Returns true if the session's user is allowed to read the collab.
   async fn can_read_collab(&self, store: &Arc<CollabManager>, object_id: &ObjectId) -> bool {
     let now = Instant::now();
-    if let Some((permission, cached_at)) = self.permission_cache.read().await.get(object_id) {
-      if now.duration_since(*cached_at) < self.cache_ttl {
-        return permission.can_read();
-      }
-    }
 
     let has_permission = store
       .enforce_read_collab(&self.workspace_id, &self.uid, object_id)
@@ -908,20 +905,7 @@ impl WorkspaceSessionHandle {
     let mut cache = self.permission_cache.write().await;
     let now = Instant::now();
     for update in updates {
-      // Always allow updates from NoAccess, but prevent downgrades from higher permissions
-      if let Some((existing_permission, _)) = cache.get(&update.object_id) {
-        // Allow update if:
-        // 1. Current permission is NoAccess (always allow upgrade from no access)
-        // 2. New permission is at least as high as existing permission
-        if *existing_permission == PermissionType::NoAccess
-          || update.permission_type.is_at_least(existing_permission)
-        {
-          cache.insert(update.object_id, (update.permission_type, now));
-        }
-      } else {
-        // No existing permission, insert the new one
-        cache.insert(update.object_id, (update.permission_type, now));
-      }
+      cache.insert(update.object_id, (update.permission_type, now));
     }
   }
 

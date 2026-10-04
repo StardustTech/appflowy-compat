@@ -31,6 +31,7 @@ use tracing::trace;
 #[derive(Clone)]
 pub struct AccessControl {
   enforcer: Arc<AFEnforcerV2>,
+  pg_pool: Option<PgPool>,
   #[allow(dead_code)]
   access_control_metrics: Arc<AccessControlMetrics>,
 }
@@ -61,6 +62,7 @@ impl AccessControl {
     );
     Ok(Self {
       enforcer: Arc::new(enforcer),
+      pg_pool: Some(pg_pool),
       access_control_metrics,
     })
   }
@@ -70,6 +72,7 @@ impl AccessControl {
     let access_control_metrics = Arc::new(AccessControlMetrics::init());
     Self {
       enforcer: Arc::new(enforcer),
+      pg_pool: None,
       access_control_metrics,
     }
   }
@@ -108,6 +111,9 @@ impl AccessControl {
   where
     T: Acts,
   {
+    if let Some(allowed) = self.current_workspace_permission(uid, &obj, &act).await? {
+      return Ok(allowed);
+    }
     self.enforcer.enforce_policy(uid, obj, act).await
   }
 
@@ -127,6 +133,9 @@ impl AccessControl {
   where
     T: Acts,
   {
+    if let Some(allowed) = self.current_workspace_permission(uid, &obj, &act).await? {
+      return Ok(allowed);
+    }
     self
       .enforcer
       .enforce_policy_with_consistency(uid, obj, act, ConsistencyMode::Strong)
@@ -137,10 +146,62 @@ impl AccessControl {
   where
     T: Acts,
   {
+    if let Some(allowed) = self.current_workspace_permission(uid, &obj, &act).await? {
+      return Ok(allowed);
+    }
     self
       .enforcer
       .enforce_policy_with_consistency(uid, obj, act, ConsistencyMode::Eventual)
       .await
+  }
+
+  // Membership is authoritative in Postgres. This also covers revocation on another server.
+  async fn current_workspace_permission<T: Acts>(
+    &self,
+    uid: &i64,
+    obj: &ObjectType,
+    act: &T,
+  ) -> Result<Option<bool>, AppError> {
+    if let (Some(pool), ObjectType::Workspace(id)) = (&self.pg_pool, obj) {
+      let workspace_id = uuid::Uuid::parse_str(id)?;
+      let member = database::workspace::select_workspace_member(pool, *uid, &workspace_id).await?;
+      return Ok(Some(member.is_some_and(|m| {
+        workspace_role_allows(&m.role, &act.to_enforce_act())
+      })));
+    }
+    Ok(None)
+  }
+}
+
+fn workspace_role_allows(role: &AFRole, action: &str) -> bool {
+  match action {
+    "read" | "write" | "r:3" => true,
+    "delete" | "r:1" => *role == AFRole::Owner,
+    "r:2" => matches!(role, AFRole::Owner | AFRole::Member),
+    "l:10" | "l:20" | "l:30" | "l:50" => {
+      AFAccessLevel::from(role) >= AFAccessLevel::from_enforce_act(action)
+    },
+    _ => false,
+  }
+}
+
+#[cfg(test)]
+mod workspace_role_tests {
+  use super::*;
+
+  #[test]
+  fn current_roles_preserve_workspace_policy() {
+    for role in [AFRole::Owner, AFRole::Member, AFRole::Guest] {
+      assert!(workspace_role_allows(&role, "read"));
+      assert!(workspace_role_allows(&role, "write"));
+      assert_eq!(
+        workspace_role_allows(&role, "delete"),
+        role == AFRole::Owner
+      );
+      assert_eq!(workspace_role_allows(&role, "r:1"), role == AFRole::Owner);
+      assert_eq!(workspace_role_allows(&role, "l:50"), role == AFRole::Owner);
+      assert!(!workspace_role_allows(&role, "unknown"));
+    }
   }
 }
 

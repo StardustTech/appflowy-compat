@@ -17,7 +17,11 @@ impl SnapshotScheduler {
   const CONCURRENCY_LIMIT: usize = 10; // only 10 workspaces at a time
   pub fn new(collab_store: Arc<CollabManager>) -> Self {
     let (schedule_queue, receiver) = tokio::sync::mpsc::unbounded_channel::<(Uuid, Rid)>();
-    tokio::spawn(Self::snapshot_task(receiver, collab_store));
+    tokio::spawn(Self::snapshot_task(
+      receiver,
+      schedule_queue.clone(),
+      collab_store,
+    ));
     Self { schedule_queue }
   }
 
@@ -58,6 +62,7 @@ impl SnapshotScheduler {
 
   async fn snapshot_task(
     mut receiver: UnboundedReceiver<(Uuid, Rid)>,
+    retry_queue: UnboundedSender<(Uuid, Rid)>,
     collab_store: Arc<CollabManager>,
   ) {
     while let Some(workspaces) = Self::get_workspaces(&mut receiver).await {
@@ -66,6 +71,7 @@ impl SnapshotScheduler {
       let mut i = 0;
       for (workspace_id, last_message_id) in workspaces {
         let collab_store = collab_store.clone();
+        let retry_queue = retry_queue.clone();
         tasks.spawn(async move {
           if let Err(err) = collab_store
             .snapshot_workspace(workspace_id, last_message_id)
@@ -77,6 +83,10 @@ impl SnapshotScheduler {
               last_message_id,
               err
             );
+            tokio::spawn(async move {
+              tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+              let _ = retry_queue.send((workspace_id, last_message_id));
+            });
           }
         });
         i += 1;

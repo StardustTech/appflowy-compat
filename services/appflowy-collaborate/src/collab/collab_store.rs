@@ -148,6 +148,7 @@ impl CollabStoreImpl {
       .cache
       .bulk_insert_collab(workspace_id, uid, params_list)
       .await
+      .map(|_| ())
   }
 }
 
@@ -355,7 +356,10 @@ impl CollabStore for CollabStoreImpl {
   }
 
   async fn check_collab_workspace(&self, workspace_id: &Uuid, object_id: &Uuid) -> AppResult<bool> {
-    self.cache.check_collab_workspace(workspace_id, object_id).await
+    self
+      .cache
+      .check_collab_workspace(workspace_id, object_id)
+      .await
   }
 
   #[instrument(level = "trace", skip_all)]

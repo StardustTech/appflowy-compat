@@ -121,25 +121,23 @@ impl CollabDiskCache {
     s3_collab_threshold: usize,
     metrics: &CollabMetrics,
   ) -> AppResult<()> {
-    let mut delete_from_s3 = Vec::new();
     let key = collab_key(workspace_id, &params.object_id);
-    if params.encoded_collab_v1.len() > s3_collab_threshold {
-      // put collab into S3
-      let encoded_collab = std::mem::take(&mut params.encoded_collab_v1);
-      tokio::spawn(Self::insert_blob_with_retries(
-        s3.clone(),
-        key,
-        encoded_collab,
-        3,
-      ));
+    let blob = if params.encoded_collab_v1.len() > s3_collab_threshold {
+      Some(std::mem::take(&mut params.encoded_collab_v1))
+    } else {
+      None
+    };
+
+    // Check ownership and stage the row before touching object storage. The caller commits
+    // only after the S3 write succeeds. A nonempty PG blob remains authoritative on reads.
+    insert_into_af_collab(transaction, uid, workspace_id, &params).await?;
+    if let Some(blob) = blob {
+      Self::insert_blob_with_retries(s3, key, blob, 3).await?;
       metrics.s3_write_collab_count.inc();
     } else {
-      // put collab into Postgres (and remove outdated version from S3)
       metrics.pg_write_collab_count.inc();
-      delete_from_s3.push(key);
     }
 
-    insert_into_af_collab(transaction, uid, workspace_id, &params).await?;
     Ok(())
   }
 
@@ -276,20 +274,6 @@ impl CollabDiskCache {
       )));
     }
 
-    match Self::get_collab_from_s3(&self.s3, key).await {
-      Ok((rid, encoded_collab)) => {
-        self.metrics.s3_read_collab_count.inc();
-        return Ok((rid, encoded_collab));
-      },
-      Err(AppError::RecordNotFound(_)) => {
-        debug!(
-          "Can not find the {}/{} from s3, trying to get from Postgres",
-          query.collab_type, query.object_id
-        );
-      },
-      Err(e) => return Err(e),
-    }
-
     const MAX_ATTEMPTS: usize = 3;
     let mut attempts = 0;
 
@@ -299,6 +283,11 @@ impl CollabDiskCache {
 
       match result {
         Ok((updated_at, data)) => {
+          if data.is_empty() {
+            let snapshot = Self::get_collab_from_s3(&self.s3, key.clone()).await?;
+            self.metrics.s3_read_collab_count.inc();
+            return Ok(snapshot);
+          }
           self.metrics.pg_read_collab_count.inc();
           let rid = Rid::new(updated_at.timestamp_millis() as u64, 0);
           let encoded_collab =
@@ -344,16 +333,12 @@ impl CollabDiskCache {
       return Ok(vec![]);
     }
 
-    let mut delete_from_s3 = Vec::new();
     let mut blobs = HashMap::new();
     for param in params_list.iter_mut() {
-      let key = collab_key(&workspace_id, &param.object_id);
       if param.encoded_collab_v1.len() > self.s3_collab_threshold {
+        let key = collab_key(&workspace_id, &param.object_id);
         let blob = std::mem::take(&mut param.encoded_collab_v1);
         blobs.insert((param.object_id, key), blob);
-      } else {
-        // put collab into Postgres (and remove outdated version from S3)
-        delete_from_s3.push(key);
       }
     }
 
@@ -362,8 +347,6 @@ impl CollabDiskCache {
     let written =
       insert_into_af_collab_bulk_for_user(&mut transaction, uid, workspace_id, &params_list)
         .await?;
-    transaction.commit().await?;
-    self.metrics.observe_pg_tx(start.elapsed());
 
     // Only upload blobs of the collabs that were actually written to this workspace.
     let written_set: HashSet<Uuid> = written.iter().copied().collect();
@@ -373,17 +356,13 @@ impl CollabDiskCache {
       .map(|((_, key), blob)| (key, blob))
       .collect();
     let s3_count = blobs.len() as u64;
-    let pg_count = delete_from_s3.len() as u64;
+    let pg_count = written.len() as u64 - s3_count;
 
     batch_put_collab_to_s3(&self.s3, blobs).await?;
-    if !delete_from_s3.is_empty() {
-      let s3 = self.s3.clone();
-      tokio::spawn(async move {
-        if let Err(err) = s3.delete_blobs(delete_from_s3).await {
-          tracing::warn!("failed to delete outdated collabs from S3: {}", err);
-        }
-      });
-    }
+    transaction.commit().await?;
+    self.metrics.observe_pg_tx(start.elapsed());
+    // Old S3 copies of now-small objects are ignored by PG-first readers. Retaining them
+    // avoids a delayed cleanup deleting a newer large snapshot at the same object key.
     self.metrics.s3_write_collab_count.inc_by(s3_count);
     self.metrics.pg_write_collab_count.inc_by(pg_count);
     Ok(written)
@@ -513,12 +492,37 @@ impl CollabDiskCache {
       }
     }
 
-    let not_found =
-      batch_get_collab_from_s3(&self.s3, workspace_id, valid_queries, &mut results).await;
-    let s3_fetch = results.len() as u64;
-    batch_select_collab_blob(&self.pg_pool, not_found, &mut results).await;
-    let pg_fetch = results.len() as u64 - s3_fetch;
-    self.metrics.s3_read_collab_count.inc_by(s3_fetch);
+    batch_select_collab_blob(&self.pg_pool, valid_queries.clone(), &mut results).await;
+    let mut s3_queries = Vec::new();
+    let mut pg_fetch = 0;
+    for query in valid_queries {
+      match results.get(&query.object_id) {
+        Some(QueryCollabResult::Success { encode_collab_v1 }) if encode_collab_v1.is_empty() => {
+          results.remove(&query.object_id);
+          s3_queries.push(query);
+        },
+        Some(QueryCollabResult::Success { .. }) => pg_fetch += 1,
+        Some(_) => {},
+        None => {
+          results.insert(
+            query.object_id,
+            QueryCollabResult::Failed {
+              error: "Failed to read collaboration storage".to_string(),
+            },
+          );
+        },
+      }
+    }
+    let s3_count = s3_queries.len() as u64;
+    for query in batch_get_collab_from_s3(&self.s3, workspace_id, s3_queries, &mut results).await {
+      results.insert(
+        query.object_id,
+        QueryCollabResult::Failed {
+          error: "Persisted collaboration blob is missing".to_string(),
+        },
+      );
+    }
+    self.metrics.s3_read_collab_count.inc_by(s3_count);
     self.metrics.pg_read_collab_count.inc_by(pg_fetch);
     results
   }
@@ -612,8 +616,7 @@ impl CollabDiskCache {
           sleep(Duration::from_secs(5)).await;
         },
         err => {
-          tracing::error!("Failed to save collab to S3: {}", err);
-          break;
+          return Err(err);
         },
       }
     }

@@ -100,7 +100,11 @@ impl CollabCache {
     workspace_id: &Uuid,
     object_id: &Uuid,
   ) -> Result<bool, AppError> {
-    if let Some(owner) = self.collab_owners.get(object_id).map(|entry| *entry.value()) {
+    if let Some(owner) = self
+      .collab_owners
+      .get(object_id)
+      .map(|entry| *entry.value())
+    {
       if owner == *workspace_id {
         return Ok(true);
       }
@@ -226,9 +230,11 @@ impl CollabCache {
     workspace_id: Uuid,
     uid: &i64,
     params_list: Vec<CollabParams>,
-  ) -> Result<(), AppError> {
+  ) -> Result<Vec<Uuid>, AppError> {
     let object_ids: Vec<Uuid> = params_list.iter().map(|p| p.object_id).collect();
-    let foreign = self.find_foreign_collabs(&workspace_id, &object_ids).await?;
+    let foreign = self
+      .find_foreign_collabs(&workspace_id, &object_ids)
+      .await?;
     let params_list: Vec<CollabParams> = params_list
       .into_iter()
       .filter(|p| !foreign.contains(&p.object_id))
@@ -312,7 +318,7 @@ impl CollabCache {
       }
     }
 
-    Ok(())
+    Ok(written.into_iter().collect())
   }
 
   #[instrument(level = "trace", skip_all)]

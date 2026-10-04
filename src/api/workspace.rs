@@ -822,15 +822,14 @@ async fn get_workspace_mentionable_person_handler(
     .workspace_access_control
     .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
     .await?;
-  let person =
-    workspace::ops::get_workspace_mentionable_person(
-      &state.pg_pool,
-      &workspace_id,
-      uid,
-      &user_uuid,
-      &person_id,
-    )
-    .await?;
+  let person = workspace::ops::get_workspace_mentionable_person(
+    &state.pg_pool,
+    &workspace_id,
+    uid,
+    &user_uuid,
+    &person_id,
+  )
+  .await?;
   Ok(AppResponse::Ok().with_data(person).into())
 }
 
@@ -1363,6 +1362,9 @@ async fn post_web_update_handler(
 
   let payload = payload.into_inner();
   let collab_type = payload.collab_type;
+
+  <yrs::Update as yrs::updates::decoder::Decode>::decode_v1(&payload.doc_state)
+    .map_err(|err| AppError::DecodeUpdateError(err.to_string()))?;
 
   update_page_collab_data(
     &state,
@@ -2421,7 +2423,10 @@ async fn post_publish_collabs_handler(
   // Every published view must be a view of this workspace.
   let folder = state.ws_server.get_folder(workspace_id).await?;
   for item in &accumulator {
-    if folder.get_view(&item.meta.view_id.to_string(), uid).is_none() {
+    if folder
+      .get_view(&item.meta.view_id.to_string(), uid)
+      .is_none()
+    {
       return Err(
         AppError::InvalidFolderView(format!(
           "View {} not found in workspace {}",
