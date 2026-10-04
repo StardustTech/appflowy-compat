@@ -1,3 +1,6 @@
+use super::ops::{
+  get_workspace_mentionable_person, is_mentionable_person_visible_to_guest, is_workspace_guest,
+};
 use super::publish::PublishedCollabStore;
 use crate::api::metrics::AppFlowyWebMetrics;
 use crate::biz::chat::ops::create_chat;
@@ -2436,13 +2439,35 @@ pub async fn update_database_data(
   .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_page_mention(
+  collab_instance_cache: &impl WorkspaceCollabInstanceCache,
+  collab_storage: &dyn CollabStore,
   pg_pool: &PgPool,
   workspace_id: &Uuid,
   view_id: &Uuid,
   uid: i64,
+  user_uuid: &Uuid,
   update: &PageMentionUpdate,
 ) -> Result<(), AppError> {
+  // The mentioned person may be notified by email about this page: it must be a person of the
+  // workspace that the user is allowed to see.
+  get_workspace_mentionable_person(pg_pool, workspace_id, uid, user_uuid, &update.person_id)
+    .await?;
+  let folder = collab_instance_cache.get_folder(*workspace_id).await?;
+  if folder.get_view(&view_id.to_string(), uid).is_none() {
+    // The folder of the server may not be in sync yet with a view that was just created: accept the
+    // view if its collab is already stored in this workspace. Fails if it belongs to another one.
+    let is_workspace_collab = collab_storage
+      .check_collab_workspace(workspace_id, view_id)
+      .await?;
+    if !is_workspace_collab {
+      return Err(AppError::InvalidFolderView(format!(
+        "View {} not found in workspace {}",
+        view_id, workspace_id
+      )));
+    }
+  }
   upsert_page_mention(pg_pool, workspace_id, view_id, uid, update).await?;
   Ok(())
 }
@@ -2452,14 +2477,20 @@ pub async fn list_page_mentionable_persons_with_access(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
   view_id: &Uuid,
+  uid: i64,
+  user_uuid: &Uuid,
 ) -> Result<Vec<MentionablePersonWithAccess>, AppError> {
   let mentionable_workspace_members_or_guests =
     select_workspace_mentionable_members_or_guests(pg_pool, workspace_id).await?;
   let user_uuid_with_access =
     get_all_user_uuids_with_access_to_page(collab_instance_cache, pg_pool, workspace_id, view_id)
       .await?;
+  let is_guest = is_workspace_guest(pg_pool, workspace_id, uid).await?;
   let mentionable_persons: Vec<MentionablePerson> = mentionable_workspace_members_or_guests
     .into_iter()
+    .filter(|person| {
+      !is_guest || is_mentionable_person_visible_to_guest(&person.uuid, &person.role, user_uuid)
+    })
     .map(|person| person.into())
     .collect();
   let mentionable_persons_with_access: Vec<MentionablePersonWithAccess> = mentionable_persons

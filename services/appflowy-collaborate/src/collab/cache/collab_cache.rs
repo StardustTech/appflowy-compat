@@ -24,7 +24,7 @@ use infra::thread_pool::ThreadPoolNoAbort;
 use itertools::{Either, Itertools};
 use rayon::prelude::*;
 use sqlx::{PgPool, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
@@ -43,7 +43,13 @@ pub struct CollabCache {
   small_collab_size: usize,
   metrics: Arc<CollabMetrics>,
   dirty_collabs: DashMap<Uuid, u64>,
+  /// Known owners (workspace id) of collab objects. A collab never changes workspace, so only
+  /// positive lookups are cached; unknown objects are always looked up again.
+  collab_owners: DashMap<Uuid, Uuid>,
 }
+
+/// Upper bound of [CollabCache::collab_owners] entries. The map is cleared when it is reached.
+const MAX_CACHED_COLLAB_OWNERS: usize = 100_000;
 
 impl CollabCache {
   pub fn new(
@@ -78,7 +84,87 @@ impl CollabCache {
       small_collab_size,
       metrics,
       dirty_collabs: DashMap::new(),
+      collab_owners: DashMap::new(),
     })
+  }
+
+  /// Checks that `object_id` may be accessed through `workspace_id`.
+  ///
+  /// Returns `Ok(true)` if the collab exists in `workspace_id`, `Ok(false)` if no collab with this
+  /// id exists yet, and [AppError::NotEnoughPermissions] if it belongs to another workspace.
+  ///
+  /// The memory cache and the S3 keys of this cache are not scoped by workspace in the same way,
+  /// so this must be verified before reading or writing a collab on behalf of a workspace.
+  pub async fn check_collab_workspace(
+    &self,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
+  ) -> Result<bool, AppError> {
+    if let Some(owner) = self.collab_owners.get(object_id).map(|entry| *entry.value()) {
+      if owner == *workspace_id {
+        return Ok(true);
+      }
+      // Don't deny access based on a cached value only.
+      self.collab_owners.remove(object_id);
+    }
+
+    match self.disk_cache.get_collab_workspace_id(object_id).await? {
+      None => Ok(false),
+      Some(owner) => {
+        self.remember_collab_owner(*object_id, owner);
+        if owner == *workspace_id {
+          Ok(true)
+        } else {
+          Err(foreign_collab_error(workspace_id, object_id))
+        }
+      },
+    }
+  }
+
+  /// Returns the subset of `object_ids` that belong to a workspace other than `workspace_id`.
+  pub async fn find_foreign_collabs(
+    &self,
+    workspace_id: &Uuid,
+    object_ids: &[Uuid],
+  ) -> Result<HashSet<Uuid>, AppError> {
+    let unknown: Vec<Uuid> = object_ids
+      .iter()
+      .filter(|oid| {
+        self
+          .collab_owners
+          .get(*oid)
+          .map(|owner| *owner.value() != *workspace_id)
+          .unwrap_or(true)
+      })
+      .copied()
+      .collect();
+    if unknown.is_empty() {
+      return Ok(HashSet::new());
+    }
+
+    let mut foreign = HashSet::new();
+    let owners = self
+      .disk_cache
+      .batch_get_collab_workspace_ids(&unknown)
+      .await?;
+    for (object_id, owner) in owners {
+      self.remember_collab_owner(object_id, owner);
+      if owner != *workspace_id {
+        warn!(
+          "collab {} was requested through workspace {} but belongs to another workspace",
+          object_id, workspace_id
+        );
+        foreign.insert(object_id);
+      }
+    }
+    Ok(foreign)
+  }
+
+  fn remember_collab_owner(&self, object_id: Uuid, workspace_id: Uuid) {
+    if self.collab_owners.len() >= MAX_CACHED_COLLAB_OWNERS {
+      self.collab_owners.clear();
+    }
+    self.collab_owners.insert(object_id, workspace_id);
   }
 
   #[instrument(level = "trace", skip_all)]
@@ -141,15 +227,28 @@ impl CollabCache {
     uid: &i64,
     params_list: Vec<CollabParams>,
   ) -> Result<(), AppError> {
-    self
+    let object_ids: Vec<Uuid> = params_list.iter().map(|p| p.object_id).collect();
+    let foreign = self.find_foreign_collabs(&workspace_id, &object_ids).await?;
+    let params_list: Vec<CollabParams> = params_list
+      .into_iter()
+      .filter(|p| !foreign.contains(&p.object_id))
+      .collect();
+
+    let written: HashSet<Uuid> = self
       .disk_cache
       .bulk_insert_collab(workspace_id, uid, params_list.clone())
-      .await?;
+      .await?
+      .into_iter()
+      .collect();
 
     // Group params by collab type for different batch sizes
     let mut database_rows = Vec::new();
     let mut other_types = Vec::new();
-    for params in params_list {
+    // Only cache what was persisted: the memory cache is keyed by object id only.
+    for params in params_list
+      .into_iter()
+      .filter(|p| written.contains(&p.object_id))
+    {
       let mills_secs = params
         .updated_at
         .as_ref()
@@ -222,6 +321,11 @@ impl CollabCache {
     workspace_id: &Uuid,
     query: QueryCollab,
   ) -> Result<(Rid, EncodedCollab), AppError> {
+    // The memory cache is keyed by object id only: make sure the object belongs to the workspace.
+    self
+      .check_collab_workspace(workspace_id, &query.object_id)
+      .await?;
+
     // Attempt to retrieve encoded collab from memory cache, falling back to disk cache if necessary.
     if let Some((rid, encoded_collab)) = self.mem_cache.get_encode_collab(&query.object_id).await {
       debug!(
@@ -441,6 +545,41 @@ impl CollabCache {
     queries: Vec<QueryCollab>,
   ) -> HashMap<Uuid, QueryCollabResult> {
     let mut results = HashMap::new();
+    let object_ids: Vec<Uuid> = queries.iter().map(|q| q.object_id).collect();
+    // Reject objects that belong to another workspace before touching any cache.
+    let foreign = match self.find_foreign_collabs(workspace_id, &object_ids).await {
+      Ok(foreign) => foreign,
+      Err(err) => {
+        for object_id in object_ids {
+          results.insert(
+            object_id,
+            QueryCollabResult::Failed {
+              error: format!("Failed to check collab workspace: {}", err),
+            },
+          );
+        }
+        return results;
+      },
+    };
+    let queries: Vec<QueryCollab> = queries
+      .into_iter()
+      .filter(|q| {
+        if foreign.contains(&q.object_id) {
+          results.insert(
+            q.object_id,
+            QueryCollabResult::Failed {
+              error: AppError::NotEnoughPermissions.to_string(),
+            },
+          );
+          false
+        } else {
+          true
+        }
+      })
+      .collect();
+    if queries.is_empty() {
+      return results;
+    }
     let object_ids: Vec<Uuid> = queries.iter().map(|q| q.object_id).collect();
     let (disk_queries, values_from_mem_cache) =
       match self.mem_cache.batch_get_data(&object_ids).await {
@@ -676,23 +815,13 @@ impl CollabCache {
   }
 
   pub async fn delete_collab(&self, workspace_id: &Uuid, object_id: &Uuid) -> Result<(), AppError> {
+    self.check_collab_workspace(workspace_id, object_id).await?;
     self.mem_cache.remove_encode_collab(object_id).await?;
     self
       .disk_cache
       .delete_collab(workspace_id, object_id)
       .await?;
     Ok(())
-  }
-
-  pub async fn is_exist(&self, workspace_id: &Uuid, oid: &Uuid) -> Result<bool, AppError> {
-    if let Ok(value) = self.mem_cache.is_exist(oid).await {
-      if value {
-        return Ok(value);
-      }
-    }
-
-    let is_exist = self.disk_cache.is_exist(workspace_id, oid).await?;
-    Ok(is_exist)
   }
 
   #[instrument(level = "debug", skip_all)]
@@ -711,8 +840,17 @@ impl CollabCache {
       })
       .collect();
 
-    self.disk_cache.batch_insert_collab(records).await?;
-    for (oid, data, expire) in mem_cache_params {
+    let written: HashSet<Uuid> = self
+      .disk_cache
+      .batch_insert_collab(records)
+      .await?
+      .into_iter()
+      .collect();
+    // Only cache what was persisted: the memory cache is keyed by object id only.
+    for (oid, data, expire) in mem_cache_params
+      .into_iter()
+      .filter(|(oid, _, _)| written.contains(oid))
+    {
       if let Err(err) = self
         .mem_cache
         .insert_encode_collab_data(&oid, &data, MillisSeconds::now(), Some(expire))
@@ -758,6 +896,14 @@ impl CollabCache {
       doc_state,
     })
   }
+}
+
+fn foreign_collab_error(workspace_id: &Uuid, object_id: &Uuid) -> AppError {
+  warn!(
+    "collab {} was requested through workspace {} but belongs to another workspace",
+    object_id, workspace_id
+  );
+  AppError::NotEnoughPermissions
 }
 
 #[inline]

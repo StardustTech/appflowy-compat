@@ -128,6 +128,7 @@ async fn get_user_image_asset_handler(
   Ok(
     HttpResponse::build(StatusCode::OK)
       .content_type(avatar.content_type)
+      .insert_header(("X-Content-Type-Options", "nosniff"))
       .body(avatar.data),
   )
 }

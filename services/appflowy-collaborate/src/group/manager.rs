@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use access_control::collab::RealtimeAccessControl;
+use app_error::AppError;
 use collab::core::collab::{default_client_id, CollabOptions, DataSource};
 use collab::core::origin::CollabOrigin;
 use collab::preclude::Collab;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 use yrs::{ReadTxn, StateVector};
 
 use crate::client::client_msg_router::ClientMessageRouter;
-use crate::error::RealtimeError;
+use crate::error::{CreateGroupFailedReason, RealtimeError};
 use crate::group::group_init::CollabGroup;
 use crate::group::state::GroupManagementState;
 use crate::metrics::CollabRealtimeMetrics;
@@ -110,6 +111,24 @@ impl GroupManager {
     object_id: Uuid,
     collab_type: CollabType,
   ) -> Result<(), RealtimeError> {
+    // The group is shared by every user of the object: never create it on behalf of a workspace
+    // that doesn't own the object.
+    if let Err(err) = self
+      .storage
+      .check_collab_workspace(&workspace_id, &object_id)
+      .await
+    {
+      return Err(match err {
+        AppError::NotEnoughPermissions => {
+          RealtimeError::CreateGroupFailed(CreateGroupFailedReason::CollabWorkspaceIdNotMatch {
+            expect: workspace_id.to_string(),
+            detail: format!("collab {} belongs to another workspace", object_id),
+          })
+        },
+        err => RealtimeError::CannotCreateGroup(err.to_string()),
+      });
+    }
+
     let res = self
       .storage
       .get_full_encode_collab(

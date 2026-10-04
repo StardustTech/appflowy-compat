@@ -61,7 +61,7 @@ async fn check_workspace_owner_or_publisher(
   Ok(())
 }
 
-fn check_collab_publish_name(publish_name: &str) -> Result<(), AppError> {
+pub fn check_collab_publish_name(publish_name: &str) -> Result<(), AppError> {
   const MAX_PUBLISH_NAME_LENGTH: usize = 128;
 
   // Check len

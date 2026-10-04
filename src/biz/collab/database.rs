@@ -170,12 +170,13 @@ fn create_card_status_field() -> Field {
 
 pub async fn check_if_row_document_collab_exists(
   pg_pool: &PgPool,
+  workspace_id: &Uuid,
   row_id: &Uuid,
 ) -> Result<bool, AppError> {
   let row_document_collab_id = meta_id_from_row_id(row_id, RowMetaKey::DocumentId);
   let row_document_collab_id = Uuid::parse_str(&row_document_collab_id)
     .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid row document collab ID")))?;
-  let exists = select_collab_id_exists(pg_pool, &row_document_collab_id).await?;
+  let exists = select_collab_id_exists(pg_pool, workspace_id, &row_document_collab_id).await?;
   Ok(exists)
 }
 

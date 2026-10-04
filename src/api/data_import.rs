@@ -59,7 +59,7 @@ async fn create_import_handler(
   trace!("[Import] Presigned url: {}", presigned_url);
 
   let (user_name, user_email) = select_name_and_email_from_uuid(&state.pg_pool, &user_uuid).await?;
-  let host = get_host_from_request(&req);
+  let host = get_host_from_request(&req, &state)?;
   let workspace = create_empty_workspace(
     &state.pg_pool,
     state.workspace_access_control.clone(),
@@ -153,7 +153,7 @@ async fn import_data_handler(
   check_maximum_task(&state, uid).await?;
 
   let (user_name, user_email) = select_name_and_email_from_uuid(&state.pg_pool, &user_uuid).await?;
-  let host = get_host_from_request(&req);
+  let host = get_host_from_request(&req, &state)?;
   let content_length = req
     .headers()
     .get("X-Content-Length")
@@ -383,11 +383,73 @@ pub async fn write_multiple_part(
   })
 }
 
-fn get_host_from_request(req: &HttpRequest) -> String {
-  req
-    .headers()
-    .get("X-Host")
-    .and_then(|h| h.to_str().ok())
-    .unwrap_or("https://beta.appflowy.cloud")
-    .to_string()
+const DEFAULT_IMPORT_HOST: &str = "https://beta.appflowy.cloud";
+
+/// Returns the base URL used to build the URLs of the files of an import.
+///
+/// The configured `APPFLOWY_BASE_URL` takes precedence: the `X-Host` header is supplied by the
+/// client (or derived from its `Host` header by the proxy) and must not be trusted when the
+/// server knows its own public URL. Without configuration, the header is only accepted when it is
+/// a plain http(s) URL.
+fn get_host_from_request(req: &HttpRequest, state: &AppState) -> Result<String, AppError> {
+  if let Some(base_url) = state.config.appflowy_base_url.as_deref() {
+    return normalize_import_host(base_url).ok_or_else(|| {
+      AppError::Internal(anyhow!("APPFLOWY_BASE_URL is not a valid http(s) URL"))
+    });
+  }
+
+  match req.headers().get("X-Host") {
+    None => Ok(DEFAULT_IMPORT_HOST.to_string()),
+    Some(value) => value
+      .to_str()
+      .ok()
+      .and_then(normalize_import_host)
+      .ok_or_else(|| AppError::InvalidRequest("Invalid X-Host header".to_string())),
+  }
+}
+
+fn normalize_import_host(value: &str) -> Option<String> {
+  let url = reqwest::Url::parse(value.trim()).ok()?;
+  let valid = matches!(url.scheme(), "http" | "https")
+    && url.host_str().is_some()
+    && url.username().is_empty()
+    && url.password().is_none()
+    && url.query().is_none()
+    && url.fragment().is_none();
+  if !valid {
+    return None;
+  }
+  Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::normalize_import_host;
+
+  #[test]
+  fn normalize_import_host_test() {
+    assert_eq!(
+      normalize_import_host("https://appflowy.example.com/").as_deref(),
+      Some("https://appflowy.example.com")
+    );
+    assert_eq!(
+      normalize_import_host("http://localhost:8080").as_deref(),
+      Some("http://localhost:8080")
+    );
+    assert_eq!(
+      normalize_import_host("https://example.com/appflowy").as_deref(),
+      Some("https://example.com/appflowy")
+    );
+    for invalid in [
+      "",
+      "example.com",
+      "javascript:alert(1)",
+      "ftp://example.com",
+      "https://user:pass@example.com",
+      "https://example.com/?a=1",
+      "https://example.com/#x",
+    ] {
+      assert_eq!(normalize_import_host(invalid), None, "{invalid}");
+    }
+  }
 }

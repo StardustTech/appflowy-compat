@@ -1,5 +1,6 @@
 mod client;
 mod database_util;
+mod folder_util;
 mod log;
 mod user;
 
@@ -10,6 +11,7 @@ mod test_client_config;
 mod workspace_ops;
 
 pub use client::*;
+pub use folder_util::*;
 pub use log::*;
 pub use user::*;
 

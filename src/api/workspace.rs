@@ -45,6 +45,7 @@ use app_error::{AppError, ErrorCode};
 use appflowy_collaborate::actix_ws::entities::{
   ClientGenerateEmbeddingMessage, ClientHttpStreamMessage, ClientHttpUpdateMessage,
 };
+use appflowy_collaborate::ws2::WorkspaceCollabInstanceCache;
 
 use bytes::BytesMut;
 use chrono::{DateTime, Duration, Utc};
@@ -61,6 +62,7 @@ use collab_rt_entity::realtime_proto::HttpRealtimeMessage;
 use collab_rt_entity::user::RealtimeUser;
 use collab_rt_entity::RealtimeMessage;
 use collab_rt_protocol::collab_from_encode_collab;
+use database::collab::select_collab_id_exists;
 use database::user::select_uid_from_email;
 use database_entity::dto::PublishCollabItem;
 use database_entity::dto::PublishInfo;
@@ -187,7 +189,11 @@ pub fn workspace_scope() -> Scope {
     )
     .service(
       web::resource("/{workspace_id}/collab/{object_id}/row-document-collab-exists")
-          .route(web::get().to(get_row_document_collab_exists_handler)),
+        .route(web::get().to(get_row_document_collab_exists_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/collab/{object_id}/collab-exists")
+        .route(web::get().to(get_collab_exists_handler)),
     )
     .service(
       web::resource("/{workspace_id}/collab/{object_id}/embed-info")
@@ -766,6 +772,8 @@ async fn list_page_mentionable_person_with_access_handler(
     &state.pg_pool,
     &workspace_id,
     &view_id,
+    uid,
+    &user_uuid,
   )
   .await?;
   Ok(
@@ -789,10 +797,13 @@ async fn put_page_mention_handler(
     .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
     .await?;
   workspace::page_view::update_page_mention(
+    &state.ws_server,
+    state.collab_storage.as_ref(),
     &state.pg_pool,
     &workspace_id,
     &view_id,
     uid,
+    &user_uuid,
     &payload.into_inner(),
   )
   .await?;
@@ -812,8 +823,14 @@ async fn get_workspace_mentionable_person_handler(
     .enforce_role_weak(&uid, &workspace_id, AFRole::Guest)
     .await?;
   let person =
-    workspace::ops::get_workspace_mentionable_person(&state.pg_pool, &workspace_id, &person_id)
-      .await?;
+    workspace::ops::get_workspace_mentionable_person(
+      &state.pg_pool,
+      &workspace_id,
+      uid,
+      &user_uuid,
+      &person_id,
+    )
+    .await?;
   Ok(AppResponse::Ok().with_data(person).into())
 }
 
@@ -1337,6 +1354,10 @@ async fn post_web_update_handler(
     .collab_access_control
     .enforce_action(&workspace_id, &uid, &object_id, Action::Write)
     .await?;
+  state
+    .collab_storage
+    .check_collab_workspace(&workspace_id, &object_id)
+    .await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   trace!("create onetime web realtime user: {}", user);
 
@@ -1371,7 +1392,34 @@ async fn get_row_document_collab_exists_handler(
     .collab_access_control
     .enforce_action(&workspace_id, &uid, &object_id, Action::Read)
     .await?;
-  let exists = check_if_row_document_collab_exists(&state.pg_pool, &object_id).await?;
+  let exists =
+    check_if_row_document_collab_exists(&state.pg_pool, &workspace_id, &object_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(
+    AFDatabaseRowDocumentCollabExistenceInfo { exists },
+  )))
+}
+
+/// Used by AppFlowy-Web to check whether the document of a database row has already been created.
+/// Unlike [get_row_document_collab_exists_handler], the object id is the id of the collab itself.
+#[instrument(level = "debug", skip_all)]
+async fn get_collab_exists_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<AFDatabaseRowDocumentCollabExistenceInfo>>> {
+  let uid = state
+    .user_cache
+    .get_user_uid(&user_uuid)
+    .await
+    .map_err(AppResponseError::from)?;
+  let (workspace_id, object_id) = path.into_inner();
+  state
+    .collab_access_control
+    .enforce_action(&workspace_id, &uid, &object_id, Action::Read)
+    .await?;
+  let exists = select_collab_id_exists(&state.pg_pool, &workspace_id, &object_id)
+    .await
+    .map_err(AppError::from)?;
   Ok(Json(AppResponse::Ok().with_data(
     AFDatabaseRowDocumentCollabExistenceInfo { exists },
   )))
@@ -1920,6 +1968,11 @@ async fn batch_get_collab_handler(
     .get_user_uid(&user_uuid)
     .await
     .map_err(AppResponseError::from)?;
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+  // Objects that belong to another workspace are reported as failed by the storage.
   let result = BatchQueryCollabResult(
     state
       .collab_storage
@@ -2308,6 +2361,12 @@ async fn post_publish_collabs_handler(
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<()>>> {
   let workspace_id = workspace_id.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  // Same requirement as the single page publish endpoint.
+  state
+    .workspace_access_control
+    .enforce_role_weak(&uid, &workspace_id, AFRole::Member)
+    .await?;
 
   let mut accumulator = Vec::<PublishCollabItem<serde_json::Value, Vec<u8>>>::new();
   let mut payload_reader: PayloadReader = PayloadReader::new(payload);
@@ -2354,6 +2413,25 @@ async fn post_publish_collabs_handler(
       AppError::InvalidRequest(String::from("did not receive any data to publish")).into(),
     );
   }
+
+  // Report invalid input before checking the views.
+  for item in &accumulator {
+    biz::workspace::publish::check_collab_publish_name(&item.meta.publish_name)?;
+  }
+  // Every published view must be a view of this workspace.
+  let folder = state.ws_server.get_folder(workspace_id).await?;
+  for item in &accumulator {
+    if folder.get_view(&item.meta.view_id.to_string(), uid).is_none() {
+      return Err(
+        AppError::InvalidFolderView(format!(
+          "View {} not found in workspace {}",
+          item.meta.view_id, workspace_id
+        ))
+        .into(),
+      );
+    }
+  }
+
   state
     .published_collab_store
     .publish_collabs(accumulator, &workspace_id, &user_uuid)
@@ -2796,10 +2874,20 @@ async fn parser_realtime_msg(
 
 #[instrument(level = "debug", skip_all)]
 async fn get_collab_embed_info_handler(
-  path: web::Path<(String, Uuid)>,
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<AFCollabEmbedInfo>>> {
-  let (_, object_id) = path.into_inner();
+  let (workspace_id, object_id) = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .collab_access_control
+    .enforce_action(&workspace_id, &uid, &object_id, Action::Read)
+    .await?;
+  state
+    .collab_storage
+    .check_collab_workspace(&workspace_id, &object_id)
+    .await?;
   let info = database::collab::select_collab_embed_info(&state.pg_pool, &object_id)
     .await
     .map_err(AppResponseError::from)?
@@ -2813,10 +2901,21 @@ async fn get_collab_embed_info_handler(
 }
 
 async fn force_generate_collab_embedding_handler(
+  user_uuid: UserUuid,
   path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
   server: Data<RealtimeServerAddr>,
 ) -> Result<Json<AppResponse<()>>> {
   let (workspace_id, object_id) = path.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .collab_access_control
+    .enforce_action(&workspace_id, &uid, &object_id, Action::Write)
+    .await?;
+  state
+    .collab_storage
+    .check_collab_workspace(&workspace_id, &object_id)
+    .await?;
   let request = ClientGenerateEmbeddingMessage {
     workspace_id,
     object_id,
@@ -2828,11 +2927,31 @@ async fn force_generate_collab_embedding_handler(
 
 #[instrument(level = "debug", skip_all)]
 async fn batch_get_collab_embed_info_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
   state: Data<AppState>,
   payload: Json<RepeatedEmbeddedCollabQuery>,
 ) -> Result<Json<AppResponse<RepeatedAFCollabEmbedInfo>>> {
-  let payload = payload.into_inner();
-  let info = database::collab::batch_select_collab_embed(&state.pg_pool, payload.0)
+  let workspace_id = workspace_id.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+  let requested = payload.into_inner().0;
+  let mut queries = Vec::with_capacity(requested.len());
+  for query in requested {
+    // Objects of other workspaces are silently left out, like objects without embeddings.
+    if state
+      .collab_storage
+      .check_collab_workspace(&workspace_id, &query.object_id)
+      .await
+      .is_ok()
+    {
+      queries.push(query);
+    }
+  }
+  let info = database::collab::batch_select_collab_embed(&state.pg_pool, queries)
     .await
     .map_err(AppResponseError::from)?;
   Ok(Json(AppResponse::Ok().with_data(info)))
@@ -2906,6 +3025,16 @@ async fn collab_full_sync_handler(
     .get_user_uid(&user_uuid)
     .await
     .map_err(AppResponseError::from)?;
+  // The response contains the state of the collab. Updates are additionally filtered by the
+  // write permission of the user in the collab group.
+  state
+    .collab_access_control
+    .enforce_action(&workspace_id, &uid, &object_id, Action::Read)
+    .await?;
+  state
+    .collab_storage
+    .check_collab_workspace(&workspace_id, &object_id)
+    .await?;
 
   let user = RealtimeUser {
     uid,

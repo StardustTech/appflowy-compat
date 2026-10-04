@@ -70,7 +70,11 @@ impl CollabStoreImpl {
     workspace_id: &WorkspaceId,
     object_id: &ObjectId,
   ) -> AppResult<()> {
-    let is_exist = self.cache.is_exist(workspace_id, object_id).await?;
+    // Fails if the collab belongs to another workspace.
+    let is_exist = self
+      .cache
+      .check_collab_workspace(workspace_id, object_id)
+      .await?;
     // If the collab already exists, check if the user has enough permissions to update collab
     // Otherwise, check if the user has enough permissions to create collab.
     if is_exist {
@@ -216,6 +220,10 @@ impl CollabStore for CollabStoreImpl {
       .check_write_workspace_permission(&workspace_id, uid)
       .await?;
     self
+      .cache
+      .check_collab_workspace(&workspace_id, &params.object_id)
+      .await?;
+    self
       .access_control
       .update_access_level_policy(uid, &params.object_id, AFAccessLevel::FullAccess)
       .await?;
@@ -249,6 +257,15 @@ impl CollabStore for CollabStoreImpl {
     self
       .check_write_workspace_permission(&workspace_id, uid)
       .await?;
+
+    let object_ids: Vec<Uuid> = params_list.iter().map(|p| p.object_id).collect();
+    let foreign = self
+      .cache
+      .find_foreign_collabs(&workspace_id, &object_ids)
+      .await?;
+    if !foreign.is_empty() {
+      return Err(AppError::NotEnoughPermissions);
+    }
 
     for params in &params_list {
       self
@@ -286,14 +303,16 @@ impl CollabStore for CollabStoreImpl {
         uid,
         object_id
       );
-      let collab_exists = self.cache.is_exist(workspace_id, object_id).await?;
-      if collab_exists {
-        self
-          .access_control
-          .enforce_action(workspace_id, &uid, object_id, Action::Read)
-          .await?;
-      }
+      self
+        .access_control
+        .enforce_action(workspace_id, &uid, object_id, Action::Read)
+        .await?;
     }
+    // Fails if the collab belongs to another workspace, whatever the origin of the request.
+    self
+      .cache
+      .check_collab_workspace(workspace_id, object_id)
+      .await?;
 
     self
       .cache
@@ -315,6 +334,7 @@ impl CollabStore for CollabStoreImpl {
     if queries.is_empty() {
       return HashMap::new();
     }
+    // Objects of other workspaces are rejected by the cache.
     self
       .cache
       .batch_get_full_collab(&workspace_id, queries, None, EncoderVersion::V1)
@@ -323,11 +343,19 @@ impl CollabStore for CollabStoreImpl {
 
   async fn delete_collab(&self, workspace_id: &Uuid, uid: &i64, object_id: &Uuid) -> AppResult<()> {
     self
+      .cache
+      .check_collab_workspace(workspace_id, object_id)
+      .await?;
+    self
       .access_control
       .enforce_access_level(workspace_id, uid, object_id, AFAccessLevel::FullAccess)
       .await?;
     self.cache.delete_collab(workspace_id, object_id).await?;
     Ok(())
+  }
+
+  async fn check_collab_workspace(&self, workspace_id: &Uuid, object_id: &Uuid) -> AppResult<bool> {
+    self.cache.check_collab_workspace(workspace_id, object_id).await
   }
 
   #[instrument(level = "trace", skip_all)]

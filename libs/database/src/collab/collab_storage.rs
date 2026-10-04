@@ -106,6 +106,13 @@ pub trait CollabStore: Send + Sync + 'static {
   /// * `Result<()>` - Returns `Ok(())` if the collaboration was deleted successfully, `Err` otherwise.
   async fn delete_collab(&self, workspace_id: &Uuid, uid: &i64, object_id: &Uuid) -> AppResult<()>;
 
+  /// Checks that the collab `object_id` may be accessed through `workspace_id`.
+  ///
+  /// Returns `Ok(true)` if the collab exists in `workspace_id`, `Ok(false)` if no collab with this
+  /// id exists yet, and [AppError::NotEnoughPermissions] if it belongs to another workspace.
+  /// This doesn't check the permissions of a user within `workspace_id`.
+  async fn check_collab_workspace(&self, workspace_id: &Uuid, object_id: &Uuid) -> AppResult<bool>;
+
   fn mark_as_editing(&self, oid: Uuid);
 }
 

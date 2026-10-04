@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use collab::entity::{EncodedCollab, EncoderVersion};
 use collab_entity::CollabType;
 use database::collab::{
-  batch_select_collab_blob, insert_into_af_collab, insert_into_af_collab_bulk_for_user,
-  is_collab_exists, select_blob_from_af_collab, select_collabs_created_since, AppResult,
+  batch_select_collab_blob, batch_select_collab_workspace_ids, insert_into_af_collab,
+  insert_into_af_collab_bulk_for_user, select_blob_from_af_collab, select_collab_workspace_id,
+  select_collabs_created_since, AppResult,
 };
 use database::file::s3_client_impl::AwsS3BucketClientImpl;
 use database::file::{BucketClient, ResponseBlob};
@@ -19,7 +20,7 @@ use database_entity::dto::{
 };
 use infra::thread_pool::ThreadPoolNoAbort;
 use sqlx::{Error, PgPool, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,15 +55,19 @@ impl CollabDiskCache {
     }
   }
 
-  pub async fn is_exist(&self, workspace_id: &Uuid, object_id: &Uuid) -> AppResult<bool> {
-    let dir = collab_key_prefix(workspace_id, object_id);
-    let resp = self.s3.list_dir(&dir, 1).await?;
-    if resp.is_empty() {
-      // fallback to Postgres
-      Ok(is_collab_exists(object_id, &self.pg_pool).await?)
-    } else {
-      Ok(true)
-    }
+  /// Returns the workspace that owns `object_id`, or `None` if the collab does not exist.
+  /// Every persisted collab has a row in Postgres (large ones keep their blob in S3), so Postgres
+  /// is the source of truth for ownership.
+  pub async fn get_collab_workspace_id(&self, object_id: &Uuid) -> AppResult<Option<Uuid>> {
+    Ok(select_collab_workspace_id(&self.pg_pool, object_id).await?)
+  }
+
+  /// Batch version of [Self::get_collab_workspace_id]. Unknown objects are absent from the result.
+  pub async fn batch_get_collab_workspace_ids(
+    &self,
+    object_ids: &[Uuid],
+  ) -> AppResult<HashMap<Uuid, Uuid>> {
+    Ok(batch_select_collab_workspace_ids(&self.pg_pool, object_ids).await?)
   }
 
   pub async fn upsert_collab(
@@ -327,14 +332,16 @@ impl CollabDiskCache {
   }
 
   //FIXME: this and `batch_insert_collab` duplicate similar logic.
+  /// Returns the ids of the collabs that were written. Collabs owned by another workspace are
+  /// skipped by the database and are not part of the result.
   pub async fn bulk_insert_collab(
     &self,
     workspace_id: Uuid,
     uid: &i64,
     mut params_list: Vec<CollabParams>,
-  ) -> Result<(), AppError> {
+  ) -> Result<Vec<Uuid>, AppError> {
     if params_list.is_empty() {
-      return Ok(());
+      return Ok(vec![]);
     }
 
     let mut delete_from_s3 = Vec::new();
@@ -343,20 +350,30 @@ impl CollabDiskCache {
       let key = collab_key(&workspace_id, &param.object_id);
       if param.encoded_collab_v1.len() > self.s3_collab_threshold {
         let blob = std::mem::take(&mut param.encoded_collab_v1);
-        blobs.insert(key, blob);
+        blobs.insert((param.object_id, key), blob);
       } else {
         // put collab into Postgres (and remove outdated version from S3)
         delete_from_s3.push(key);
       }
     }
-    let s3_count = blobs.len() as u64;
-    let pg_count = delete_from_s3.len() as u64;
 
     let mut transaction = self.pg_pool.begin().await?;
     let start = Instant::now();
-    insert_into_af_collab_bulk_for_user(&mut transaction, uid, workspace_id, &params_list).await?;
+    let written =
+      insert_into_af_collab_bulk_for_user(&mut transaction, uid, workspace_id, &params_list)
+        .await?;
     transaction.commit().await?;
     self.metrics.observe_pg_tx(start.elapsed());
+
+    // Only upload blobs of the collabs that were actually written to this workspace.
+    let written_set: HashSet<Uuid> = written.iter().copied().collect();
+    let blobs: HashMap<String, Bytes> = blobs
+      .into_iter()
+      .filter(|((object_id, _), _)| written_set.contains(object_id))
+      .map(|((_, key), blob)| (key, blob))
+      .collect();
+    let s3_count = blobs.len() as u64;
+    let pg_count = delete_from_s3.len() as u64;
 
     batch_put_collab_to_s3(&self.s3, blobs).await?;
     if !delete_from_s3.is_empty() {
@@ -369,15 +386,17 @@ impl CollabDiskCache {
     }
     self.metrics.s3_write_collab_count.inc_by(s3_count);
     self.metrics.pg_write_collab_count.inc_by(pg_count);
-    Ok(())
+    Ok(written)
   }
 
+  /// Returns the ids of the collabs that were written. A record that fails (e.g. because the
+  /// collab belongs to another workspace) is rolled back and left out of the result.
   pub async fn batch_insert_collab(
     &self,
     records: Vec<PendingCollabWrite>,
-  ) -> Result<(), AppError> {
+  ) -> Result<Vec<Uuid>, AppError> {
     if records.is_empty() {
-      return Ok(());
+      return Ok(vec![]);
     }
 
     let s3 = self.s3.clone();
@@ -392,8 +411,10 @@ impl CollabDiskCache {
 
     // Insert each record into the database within the transaction context
     let mut action_description = String::new();
+    let mut written = Vec::with_capacity(records.len());
     for (index, record) in records.into_iter().enumerate() {
       let params = record.params;
+      let object_id = params.object_id;
       action_description = format!("{}", params);
       let savepoint_name = format!("sp_{}", index);
 
@@ -401,7 +422,7 @@ impl CollabDiskCache {
       sqlx::query(&format!("SAVEPOINT {}", savepoint_name))
         .execute(transaction.deref_mut())
         .await?;
-      if let Err(_err) = Self::upsert_collab_with_transaction(
+      match Self::upsert_collab_with_transaction(
         &record.workspace_id,
         &record.uid,
         params,
@@ -412,9 +433,12 @@ impl CollabDiskCache {
       )
       .await
       {
-        sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", savepoint_name))
-          .execute(transaction.deref_mut())
-          .await?;
+        Ok(()) => written.push(object_id),
+        Err(_err) => {
+          sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", savepoint_name))
+            .execute(transaction.deref_mut())
+            .await?;
+        },
       }
     }
 
@@ -434,7 +458,7 @@ impl CollabDiskCache {
         )));
       },
     }
-    Ok(())
+    Ok(written)
   }
 
   /// Batch retrieves collaboration data for multiple queries.
@@ -500,15 +524,17 @@ impl CollabDiskCache {
   }
 
   pub async fn delete_collab(&self, workspace_id: &Uuid, object_id: &Uuid) -> AppResult<()> {
-    sqlx::query!(
+    // Scope the deletion to the workspace so that a collab of another workspace is never touched.
+    sqlx::query(
       r#"
         UPDATE af_collab
         SET deleted_at = $2
-        WHERE oid = $1;
-        "#,
-      object_id,
-      chrono::Utc::now()
+        WHERE oid = $1 AND workspace_id = $3;
+      "#,
     )
+    .bind(object_id)
+    .bind(chrono::Utc::now())
+    .bind(workspace_id)
     .execute(&self.pg_pool)
     .await?;
 
@@ -717,10 +743,6 @@ async fn batch_get_collab_from_s3(
   // gather remaining results from the last chunk
   gather(&mut join_set, results, &mut not_found).await;
   not_found
-}
-
-fn collab_key_prefix(workspace_id: &Uuid, object_id: &Uuid) -> String {
-  format!("collabs/{}/{}/", workspace_id, object_id)
 }
 
 fn collab_key(workspace_id: &Uuid, object_id: &Uuid) -> String {

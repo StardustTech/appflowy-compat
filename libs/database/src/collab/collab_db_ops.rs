@@ -57,7 +57,7 @@ pub async fn insert_into_af_collab(
     params.updated_at.map(|v| v.timestamp_millis())
   );
 
-  sqlx::query!(
+  let result = sqlx::query!(
     r#"
       INSERT INTO af_collab (oid, blob, len, partition_key, owner_uid, workspace_id, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW())) ON CONFLICT (oid)
@@ -78,6 +78,17 @@ pub async fn insert_into_af_collab(
       workspace_id, uid, params.object_id, params.collab_type, err,
     ))
   })?;
+
+  // The upsert is a no-op when the object already exists in another workspace. Report it instead
+  // of silently succeeding, so callers don't treat foreign data as persisted (e.g. by caching it).
+  if result.rows_affected() == 0 {
+    tracing::warn!(
+      "rejected write of collab {} through workspace {}: it belongs to another workspace",
+      params.object_id,
+      workspace_id
+    );
+    return Err(AppError::NotEnoughPermissions);
+  }
 
   Ok(())
 }
@@ -143,9 +154,9 @@ pub async fn insert_into_af_collab_bulk_for_user(
   uid: &i64,
   workspace_id: Uuid,
   collab_params_list: &[CollabParams],
-) -> Result<(), AppError> {
+) -> Result<Vec<Uuid>, AppError> {
   if collab_params_list.is_empty() {
-    return Ok(());
+    return Ok(vec![]);
   }
 
   // Insert values into `af_collab` tables in bulk
@@ -171,33 +182,43 @@ pub async fn insert_into_af_collab_bulk_for_user(
 
   let uids: Vec<i64> = vec![*uid; object_ids.len()];
   let workspace_ids: Vec<Uuid> = vec![workspace_id; object_ids.len()];
-  // Bulk insert into `af_collab` for the provided collab params
-  sqlx::query!(
-      r#"
-        INSERT INTO af_collab (oid, blob, len, partition_key, owner_uid, workspace_id, updated_at)
-        SELECT * FROM UNNEST($1::uuid[], $2::bytea[], $3::int[], $4::int[], $5::bigint[], $6::uuid[], $7::timestamp with time zone[])
-        ON CONFLICT (oid)
-        DO UPDATE SET blob = excluded.blob, len = excluded.len, updated_at = excluded.updated_at where af_collab.workspace_id = excluded.workspace_id
-      "#,
-      &object_ids,
-      &blobs,
-      &lengths,
-      &partition_keys,
-      &uids,
-      &workspace_ids,
-      &updated_at
-    )
-      .execute(tx.deref_mut())
-      .await
-      .map_err(|err| {
-        AppError::Internal(anyhow!(
-            "Bulk insert/update into af_collab failed for uid: {}, error details: {:?}",
-            uid,
-            err
-        ))
-      })?;
+  // Bulk insert into `af_collab` for the provided collab params. Objects that already exist in
+  // another workspace are left untouched and are not part of the returned list.
+  let written_object_ids = sqlx::query_scalar::<_, Uuid>(
+    r#"
+      INSERT INTO af_collab (oid, blob, len, partition_key, owner_uid, workspace_id, updated_at)
+      SELECT * FROM UNNEST($1::uuid[], $2::bytea[], $3::int[], $4::int[], $5::bigint[], $6::uuid[], $7::timestamp with time zone[])
+      ON CONFLICT (oid)
+      DO UPDATE SET blob = excluded.blob, len = excluded.len, updated_at = excluded.updated_at where af_collab.workspace_id = excluded.workspace_id
+      RETURNING oid
+    "#,
+  )
+  .bind(&object_ids)
+  .bind(&blobs)
+  .bind(&lengths)
+  .bind(&partition_keys)
+  .bind(&uids)
+  .bind(&workspace_ids)
+  .bind(&updated_at)
+  .fetch_all(tx.deref_mut())
+  .await
+  .map_err(|err| {
+    AppError::Internal(anyhow!(
+      "Bulk insert/update into af_collab failed for uid: {}, error details: {:?}",
+      uid,
+      err
+    ))
+  })?;
 
-  Ok(())
+  if written_object_ids.len() != object_ids.len() {
+    tracing::warn!(
+      "skipped {} collabs that belong to another workspace than {}",
+      object_ids.len() - written_object_ids.len(),
+      workspace_id
+    );
+  }
+
+  Ok(written_object_ids)
 }
 
 #[inline]
@@ -230,22 +251,28 @@ where
   Ok(records)
 }
 
-pub async fn select_collab_id_exists<'a, E>(conn: E, object_id: &Uuid) -> Result<bool, sqlx::Error>
+/// Returns whether the collab exists in the given workspace. A collab of another workspace is
+/// reported as missing, so as not to reveal the objects of other workspaces.
+pub async fn select_collab_id_exists<'a, E>(
+  conn: E,
+  workspace_id: &Uuid,
+  object_id: &Uuid,
+) -> Result<bool, sqlx::Error>
 where
   E: Executor<'a, Database = Postgres>,
 {
-  let exists = sqlx::query_scalar!(
+  sqlx::query_scalar::<_, bool>(
     r#"
         SELECT EXISTS (
             SELECT 1 FROM af_collab
-            WHERE oid = $1 AND deleted_at IS NULL
+            WHERE oid = $1 AND workspace_id = $2 AND deleted_at IS NULL
         )
         "#,
-    object_id,
   )
+  .bind(object_id)
+  .bind(workspace_id)
   .fetch_one(conn)
-  .await?;
-  Ok(exists.unwrap_or(false))
+  .await
 }
 
 #[inline]
@@ -544,6 +571,34 @@ fn transform_record_not_found_error(
       }
     },
   }
+}
+
+/// Returns the workspace that owns the collab `oid`, or `None` when no such collab exists.
+/// Soft-deleted collabs still belong to their workspace, so they are included.
+#[inline]
+pub async fn select_collab_workspace_id<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  oid: &Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+  sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM af_collab WHERE oid = $1")
+    .bind(oid)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Batch version of [select_collab_workspace_id]. Unknown object ids are absent from the result.
+#[inline]
+pub async fn batch_select_collab_workspace_ids<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  oids: &[Uuid],
+) -> Result<HashMap<Uuid, Uuid>, sqlx::Error> {
+  let rows = sqlx::query_as::<_, (Uuid, Uuid)>(
+    "SELECT oid, workspace_id FROM af_collab WHERE oid = ANY($1)",
+  )
+  .bind(oids)
+  .fetch_all(executor)
+  .await?;
+  Ok(rows.into_iter().collect())
 }
 
 /// Checks for the existence of a collaboration entry in the `af_collab` table using a specified `oid`.

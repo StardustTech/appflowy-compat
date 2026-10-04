@@ -7,7 +7,9 @@ use client_api::entity::{
   PublishInfoMeta,
 };
 use client_api_test::TestClient;
-use client_api_test::{generate_unique_registered_user_client, localhost_client};
+use client_api_test::{
+  add_views_to_workspace_folder, generate_unique_registered_user_client, localhost_client,
+};
 use collab::core::collab::default_client_id;
 use collab::util::MapExt;
 use collab_database::database::DatabaseBody;
@@ -168,6 +170,8 @@ async fn test_publish_doc() {
   let view_id_1 = Uuid::new_v4();
   let publish_name_2 = "publish_name-2";
   let view_id_2 = Uuid::new_v4();
+  let other_view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&c, &workspace_id, &[view_id_1, view_id_2, other_view_id]).await;
 
   // User publishes two collabs
   c.publish_collabs::<MyCustomMetadata, &[u8]>(
@@ -208,7 +212,7 @@ async fn test_publish_doc() {
       &workspace_id,
       vec![PublishCollabItem {
         meta: PublishCollabMetadata {
-          view_id: Uuid::new_v4(),
+          view_id: other_view_id,
           publish_name: publish_name_1.to_string(),
           metadata: MyCustomMetadata {
             title: "some_other_title".to_string(),
@@ -493,6 +497,7 @@ async fn test_publish_comments() {
 
   let publish_name = "published-view";
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&page_owner_client, &workspace_id, &[view_id]).await;
   page_owner_client
     .publish_collabs::<MyCustomMetadata, &[u8]>(
       &workspace_id,
@@ -725,6 +730,7 @@ async fn test_excessive_comment_length() {
 
   let publish_name = "published-view";
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&client, &workspace_id, &[view_id]).await;
   client
     .publish_collabs::<MyCustomMetadata, &[u8]>(
       &workspace_id,
@@ -763,6 +769,7 @@ async fn test_publish_reactions() {
 
   let publish_name = "published-view";
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&page_owner_client, &workspace_id, &[view_id]).await;
   page_owner_client
     .publish_collabs::<MyCustomMetadata, &[u8]>(
       &workspace_id,
@@ -897,10 +904,14 @@ async fn test_publish_load_test() {
   }
 
   // publish 1000 collabs
-  let collabs: Vec<PublishCollabItem<MyCustomMetadata, Vec<u8>>> = (0..1000)
-    .map(|i| PublishCollabItem {
+  let view_ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
+  add_views_to_workspace_folder(&c, &workspace_id, &view_ids).await;
+  let collabs: Vec<PublishCollabItem<MyCustomMetadata, Vec<u8>>> = view_ids
+    .iter()
+    .enumerate()
+    .map(|(i, view_id)| PublishCollabItem {
       meta: PublishCollabMetadata {
-        view_id: Uuid::new_v4(),
+        view_id: *view_id,
         publish_name: format!("publish-name-{}", i),
         metadata: MyCustomMetadata {
           title: format!("title_{}", i),
@@ -935,6 +946,7 @@ async fn workspace_member_publish_unpublish() {
     .unwrap();
 
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&client_1.api_client, &workspace_id, &[view_id]).await;
   // member can publish without owner setting namespace
   client_2
     .api_client
@@ -1747,6 +1759,7 @@ async fn test_republish_doc() {
 
   let publish_name = "my-publish-name";
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&c, &workspace_id, &[view_id]).await;
 
   // User publishes 1 doc
   c.publish_collabs::<MyCustomMetadata, &[u8]>(
@@ -1800,6 +1813,7 @@ async fn test_republish_doc() {
   {
     // User publish another doc with different id but same publish name
     let view_id_2 = Uuid::new_v4();
+    add_views_to_workspace_folder(&c, &workspace_id, &[view_id_2]).await;
     c.publish_collabs::<MyCustomMetadata, &[u8]>(
       &workspace_id,
       vec![PublishCollabItem {
@@ -1845,6 +1859,7 @@ async fn test_republish_patch() {
 
   let publish_name = "my-publish-name";
   let view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&c, &workspace_id, &[view_id]).await;
 
   // User publishes 1 doc
   c.publish_collabs::<MyCustomMetadata, &[u8]>(
@@ -1873,6 +1888,7 @@ async fn test_republish_patch() {
   // User publish another doc
   let publish_name_2 = "my-publish-name-2";
   let view_id_2 = Uuid::new_v4();
+  add_views_to_workspace_folder(&c, &workspace_id, &[view_id_2]).await;
   c.publish_collabs::<MyCustomMetadata, &[u8]>(
     &workspace_id,
     vec![PublishCollabItem {
@@ -1904,4 +1920,122 @@ async fn test_republish_patch() {
   )
   .await
   .unwrap();
+}
+
+fn publish_item(
+  view_id: Uuid,
+  publish_name: &str,
+  title: &str,
+  data: &'static str,
+) -> PublishCollabItem<MyCustomMetadata, &'static [u8]> {
+  PublishCollabItem {
+    meta: PublishCollabMetadata {
+      view_id,
+      publish_name: publish_name.to_string(),
+      metadata: MyCustomMetadata {
+        title: title.to_string(),
+      },
+    },
+    data: data.as_bytes(),
+    comments_enabled: true,
+    duplicate_enabled: true,
+  }
+}
+
+#[tokio::test]
+async fn publish_collabs_to_other_workspace_test() {
+  let (alice, _) = generate_unique_registered_user_client().await;
+  let alice_workspace_id = get_first_workspace(&alice).await;
+  let alice_namespace = Uuid::new_v4().to_string();
+  alice
+    .set_workspace_publish_namespace(&alice_workspace_id, alice_namespace.clone())
+    .await
+    .unwrap();
+  let (bob, _) = generate_unique_registered_user_client().await;
+  let bob_workspace_id = get_first_workspace(&bob).await;
+
+  let alice_view_id = Uuid::new_v4();
+  let bob_view_id = Uuid::new_v4();
+  add_views_to_workspace_folder(&alice, &alice_workspace_id, &[alice_view_id]).await;
+  add_views_to_workspace_folder(&bob, &bob_workspace_id, &[bob_view_id]).await;
+
+  alice
+    .publish_collabs(
+      &alice_workspace_id,
+      vec![publish_item(
+        alice_view_id,
+        "alice-page",
+        "alice-title",
+        "alice-data",
+      )],
+    )
+    .await
+    .unwrap();
+
+  // Bob, who is not a member of alice's workspace, publishes in its namespace: with his own
+  // view, and with alice's view, both reusing the publish name of alice's page.
+  for view_id in [bob_view_id, alice_view_id] {
+    let err = bob
+      .publish_collabs(
+        &alice_workspace_id,
+        vec![publish_item(view_id, "alice-page", "pwned", "pwned")],
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotEnoughPermissions, "{:?}", err);
+  }
+
+  // Bob publishes alice's view in his own workspace, along with his own view.
+  let err = bob
+    .publish_collabs(
+      &bob_workspace_id,
+      vec![
+        publish_item(bob_view_id, "bob-page", "bob-title", "bob-data"),
+        publish_item(alice_view_id, "stolen-page", "pwned", "pwned"),
+      ],
+    )
+    .await
+    .unwrap_err();
+  assert_eq!(err.code, ErrorCode::InvalidFolderView, "{:?}", err);
+
+  // Alice's published page is untouched.
+  let guest = localhost_client();
+  let published = guest
+    .get_published_collab::<MyCustomMetadata>(&alice_namespace, "alice-page")
+    .await
+    .unwrap();
+  assert_eq!(published.title, "alice-title");
+  let blob = guest
+    .get_published_collab_blob(&alice_namespace, "alice-page")
+    .await
+    .unwrap();
+  assert_eq!(blob, "alice-data");
+  let info = guest
+    .get_published_collab_info(&alice_view_id)
+    .await
+    .unwrap();
+  assert_eq!(info.namespace, alice_namespace);
+  let alice_published = alice
+    .list_published_views(&alice_workspace_id)
+    .await
+    .unwrap();
+  assert_eq!(alice_published.len(), 1);
+  assert_eq!(alice_published[0].info.view_id, alice_view_id);
+  assert!(bob
+    .list_published_views(&bob_workspace_id)
+    .await
+    .unwrap()
+    .is_empty());
+
+  // Bob can publish his own view in his own workspace.
+  bob
+    .publish_collabs(
+      &bob_workspace_id,
+      vec![publish_item(bob_view_id, "bob-page", "bob-title", "bob-data")],
+    )
+    .await
+    .unwrap();
+  let bob_published = bob.list_published_views(&bob_workspace_id).await.unwrap();
+  assert_eq!(bob_published.len(), 1);
+  assert_eq!(bob_published[0].info.view_id, bob_view_id);
 }

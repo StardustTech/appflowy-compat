@@ -159,6 +159,22 @@ impl Workspace {
               },
             });
           },
+          Err(AppError::NotEnoughPermissions) => {
+            tracing::trace!(
+              "user {} lack of permission to read collab {}",
+              sender.uid,
+              msg.object_id
+            );
+            sender.conn.do_send(WsOutput {
+              message: ServerMessage::AccessChanges {
+                object_id: msg.object_id,
+                collab_type,
+                can_read: false,
+                can_write: false,
+                reason: AccessChangedReason::PermissionDenied,
+              },
+            });
+          },
           Err(err) => {
             tracing::error!(
               "failed to resolve state of {}/{}/{}: {}",
@@ -177,11 +193,7 @@ impl Workspace {
         }
 
         // Check if the user has permission to write to the collab
-        if sender
-          .can_write_collab(&store, &msg.object_id)
-          .await
-          .is_err()
-        {
+        if !sender.can_write_collab(&store, &msg.object_id).await {
           tracing::trace!(
             "user {} lack of permission to write to collab {}",
             sender.uid,
@@ -204,6 +216,14 @@ impl Workspace {
         }
       },
       InputMessage::AwarenessUpdate(update) => {
+        if !sender.can_read_collab(&store, &msg.object_id).await {
+          tracing::trace!(
+            "user {} lack of permission to send awareness of collab {}",
+            sender.uid,
+            msg.object_id,
+          );
+          return;
+        }
         if let Err(err) = store
           .publish_awareness_update(
             msg.workspace_id,
@@ -246,10 +266,9 @@ impl Workspace {
         since
       );
       for collab in new_collabs {
-        if session_handle
+        if !session_handle
           .can_read_collab(&store, &collab.object_id)
           .await
-          .is_err()
         {
           tracing::trace!(
             "user {} lack of permission. skip publish new collab {}",
@@ -296,10 +315,9 @@ impl Workspace {
         update.update.len()
       );
 
-      if session_handle
+      if !session_handle
         .can_read_collab(&store, &update.object_id)
         .await
-        .is_err()
       {
         tracing::trace!(
           "user {} lack of permission. skip publish collab {}, client_id: {}",
@@ -434,7 +452,7 @@ impl StreamHandler<anyhow::Result<UpdateStreamMessage>> for Workspace {
           let store = Arc::clone(&store);
           let update = update.clone();
           async move {
-            if session.can_read_collab(&store, &object_id).await.is_ok() {
+            if session.can_read_collab(&store, &object_id).await {
               session.conn.do_send(WsOutput {
                 message: ServerMessage::Update {
                   object_id,
@@ -816,15 +834,12 @@ impl WorkspaceSessionHandle {
     }
   }
 
-  async fn can_write_collab(
-    &self,
-    store: &Arc<CollabManager>,
-    object_id: &ObjectId,
-  ) -> Result<bool, AppError> {
+  /// Returns true if the session's user is allowed to write the collab.
+  async fn can_write_collab(&self, store: &Arc<CollabManager>, object_id: &ObjectId) -> bool {
     let now = Instant::now();
     if let Some((permission, cached_at)) = self.permission_cache.read().await.get(object_id) {
       if now.duration_since(*cached_at) < self.cache_ttl {
-        return Ok(permission.can_write());
+        return permission.can_write();
       }
     }
 
@@ -834,9 +849,16 @@ impl WorkspaceSessionHandle {
       .await
       .is_ok();
 
-    // Update cache with the actual permission state
+    // Update cache with the actual permission state. A user who can't write may still be allowed
+    // to read, so don't cache `NoAccess` for them.
     let permission_type = if has_permission {
       PermissionType::Write
+    } else if store
+      .enforce_read_collab(&self.workspace_id, &self.uid, object_id)
+      .await
+      .is_ok()
+    {
+      PermissionType::Read
     } else {
       PermissionType::NoAccess
     };
@@ -847,18 +869,15 @@ impl WorkspaceSessionHandle {
       .await
       .insert(*object_id, (permission_type, now));
 
-    Ok(has_permission)
+    has_permission
   }
 
-  async fn can_read_collab(
-    &self,
-    store: &Arc<CollabManager>,
-    object_id: &ObjectId,
-  ) -> Result<bool, AppError> {
+  /// Returns true if the session's user is allowed to read the collab.
+  async fn can_read_collab(&self, store: &Arc<CollabManager>, object_id: &ObjectId) -> bool {
     let now = Instant::now();
     if let Some((permission, cached_at)) = self.permission_cache.read().await.get(object_id) {
       if now.duration_since(*cached_at) < self.cache_ttl {
-        return Ok(permission.can_read());
+        return permission.can_read();
       }
     }
 
@@ -872,7 +891,7 @@ impl WorkspaceSessionHandle {
       // Check if there's already a higher permission cached
       if let Some((existing_permission, _)) = cache.get(object_id) {
         if existing_permission.is_higher_than(&PermissionType::Read) {
-          return Ok(true);
+          return true;
         }
       }
       cache.insert(*object_id, (PermissionType::Read, now));
@@ -880,7 +899,7 @@ impl WorkspaceSessionHandle {
       cache.insert(*object_id, (PermissionType::NoAccess, now));
     }
 
-    Ok(has_permission)
+    has_permission
   }
 
   /// Apply permission updates and send WebSocket notification

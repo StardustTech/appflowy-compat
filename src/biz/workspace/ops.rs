@@ -741,56 +741,83 @@ pub async fn num_pending_task(uid: i64, pg_pool: &PgPool) -> Result<i64, AppErro
 pub async fn list_workspace_mentionable_persons(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
-  _uid: i64,
-  _user_uuid: &Uuid,
+  uid: i64,
+  user_uuid: &Uuid,
 ) -> Result<Vec<MentionablePerson>, AppError> {
   let mentionable_workspace_members_or_guests =
     select_workspace_mentionable_members_or_guests(pg_pool, workspace_id).await?;
-  // TODO: if user is guest, we should not return the contact list
-  // let is_guest = get_workspace_member(uid, pg_pool, workspace_id).await?.role == AFRole::Guest;
-  let mut persons = vec![];
-  persons.extend(
-    mentionable_workspace_members_or_guests
-      .into_iter()
-      .map(|row| row.into()),
-  );
+  let is_guest = is_workspace_guest(pg_pool, workspace_id, uid).await?;
+  let persons = mentionable_workspace_members_or_guests
+    .into_iter()
+    .filter(|row| {
+      !is_guest || is_mentionable_person_visible_to_guest(&row.uuid, &row.role, user_uuid)
+    })
+    .map(|row| row.into())
+    .collect();
   Ok(persons)
+}
+
+/// Returns true if the user is only a guest of the workspace.
+pub async fn is_workspace_guest(
+  pg_pool: &PgPool,
+  workspace_id: &Uuid,
+  uid: i64,
+) -> Result<bool, AppError> {
+  Ok(get_workspace_member(uid, pg_pool, workspace_id).await?.role == AFRole::Guest)
+}
+
+/// Among the mentionable persons of a workspace, a guest only sees themselves and the owner.
+pub fn is_mentionable_person_visible_to_guest(
+  person_uuid: &Uuid,
+  person_role: &AFRole,
+  guest_uuid: &Uuid,
+) -> bool {
+  person_uuid == guest_uuid || *person_role == AFRole::Owner
 }
 
 pub async fn list_workspace_mentionable_persons_with_last_mentioned_time(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
-  _uid: i64,
-  _user_uuid: &Uuid,
+  uid: i64,
+  user_uuid: &Uuid,
 ) -> Result<Vec<MentionablePersonWithLastMentionedTime>, AppError> {
   let mentionable_workspace_members_or_guests =
     select_workspace_mentionable_members_or_guests_with_last_mentioned_time(pg_pool, workspace_id)
       .await?;
-  // TODO: if user is guest, we should not return the contact list
-  // let is_guest = get_workspace_member(uid, pg_pool, workspace_id).await?.role == AFRole::Guest;
-  let mut persons = vec![];
-  persons.extend(
-    mentionable_workspace_members_or_guests
-      .into_iter()
-      .map(|row| row.into()),
-  );
+  let is_guest = is_workspace_guest(pg_pool, workspace_id, uid).await?;
+  let persons = mentionable_workspace_members_or_guests
+    .into_iter()
+    .filter(|row| {
+      !is_guest || is_mentionable_person_visible_to_guest(&row.uuid, &row.role, user_uuid)
+    })
+    .map(|row| row.into())
+    .collect();
   Ok(persons)
 }
 
+/// Returns the mentionable person `person_id` of the workspace, as seen by the user `uid`.
 pub async fn get_workspace_mentionable_person(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
+  uid: i64,
+  user_uuid: &Uuid,
   person_id: &Uuid,
 ) -> Result<MentionablePerson, AppError> {
   let mentionable_workspace_members_or_guests =
     select_workspace_mentionable_member_or_guest_by_uuid(pg_pool, workspace_id, person_id).await?;
-  if let Some(mentionable) = mentionable_workspace_members_or_guests {
-    Ok(mentionable.into())
-  } else {
-    Err(AppError::RecordNotFound(format!(
+  let is_guest = is_workspace_guest(pg_pool, workspace_id, uid).await?;
+  match mentionable_workspace_members_or_guests {
+    // A person hidden from a guest is reported as not found, so as not to reveal its existence.
+    Some(mentionable)
+      if !is_guest
+        || is_mentionable_person_visible_to_guest(&mentionable.uuid, &mentionable.role, user_uuid) =>
+    {
+      Ok(mentionable.into())
+    },
+    _ => Err(AppError::RecordNotFound(format!(
       "person with ID {} is neither a workspace member nor contact",
       person_id
-    )))
+    ))),
   }
 }
 
@@ -800,6 +827,65 @@ pub async fn update_workspace_member_profile(
   uid: i64,
   updated_profile: &WorkspaceMemberProfile,
 ) -> Result<(), AppError> {
+  validate_workspace_member_profile(updated_profile)?;
   upsert_workspace_member_profile(pg_pool, workspace_id, uid, updated_profile).await?;
+  Ok(())
+}
+
+const MAX_MEMBER_PROFILE_NAME_LEN: usize = 256;
+const MAX_MEMBER_PROFILE_IMAGE_LEN: usize = 2048;
+const MAX_MEMBER_PROFILE_DESCRIPTION_LEN: usize = 4096;
+
+/// The profile is shown to the other members of the workspace, so the image fields must not carry
+/// a script or an inline document. They are not restricted to http(s) URLs because clients may
+/// also store an emoji or the identifier of a built-in cover.
+fn validate_workspace_member_profile(profile: &WorkspaceMemberProfile) -> Result<(), AppError> {
+  fn check_text(field: &str, value: &str, max_len: usize, multiline: bool) -> Result<(), AppError> {
+    if value.chars().count() > max_len {
+      return Err(AppError::InvalidRequest(format!(
+        "{field} must not exceed {max_len} characters"
+      )));
+    }
+    if value
+      .chars()
+      .any(|c| {
+        let bidi_control = matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        bidi_control || (c.is_control() && !(multiline && matches!(c, '\n' | '\r' | '\t')))
+      })
+    {
+      return Err(AppError::InvalidRequest(format!(
+        "{field} contains control characters"
+      )));
+    }
+    Ok(())
+  }
+
+  check_text("name", &profile.name, MAX_MEMBER_PROFILE_NAME_LEN, false)?;
+  if profile.name.trim().is_empty() {
+    return Err(AppError::InvalidRequest("name must not be empty".to_string()));
+  }
+  if let Some(description) = &profile.description {
+    check_text(
+      "description",
+      description,
+      MAX_MEMBER_PROFILE_DESCRIPTION_LEN,
+      true,
+    )?;
+  }
+  for (field, value) in [
+    ("avatar_url", &profile.avatar_url),
+    ("cover_image_url", &profile.cover_image_url),
+    ("custom_image_url", &profile.custom_image_url),
+  ] {
+    let Some(value) = value else { continue };
+    check_text(field, value, MAX_MEMBER_PROFILE_IMAGE_LEN, false)?;
+    if let Ok(url) = reqwest::Url::parse(value.trim()) {
+      if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::InvalidRequest(format!(
+          "{field} must be an http(s) URL"
+        )));
+      }
+    }
+  }
   Ok(())
 }

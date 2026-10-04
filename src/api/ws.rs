@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::biz::authentication::jwt::{authorization_from_token, UserUuid};
 use crate::state::AppState;
+use access_control::act::Action;
 use actix::Addr;
 use actix_http::header::AUTHORIZATION;
 use actix_web::web::{Data, Path, Payload};
@@ -119,6 +120,11 @@ pub async fn establish_ws_connection_v2(
   let auth = authorization_from_token(params.access_token.as_str(), &jwt_secret)?;
   let user_uuid = UserUuid::from_auth(auth)?;
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  // A session is bound to a single workspace: only its members may connect to it.
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
   let info = SessionInfo::new(
     params.client_id,
     uid,

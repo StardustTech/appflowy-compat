@@ -1,5 +1,5 @@
 use crate::client::client_msg_router::ClientMessageRouter;
-use crate::error::RealtimeError;
+use crate::error::{CreateGroupFailedReason, RealtimeError};
 use crate::group::manager::GroupManager;
 use crate::group::null_sender::NullSender;
 use async_stream::stream;
@@ -174,6 +174,12 @@ impl GroupCommandRunner {
       if !is_user_subscribed {
         // safety: messages is not empty because we have checked it before
         let first_message = messages.first().unwrap();
+        if let ClientCollabMessage::ClientInitSync { data, .. } = first_message {
+          let workspace_id = Uuid::parse_str(&data.workspace_id)?;
+          self
+            .ensure_group_workspace(&object_id, &workspace_id)
+            .await?;
+        }
         self
           .subscribe_group_with_message(&user, first_message)
           .await?;
@@ -243,6 +249,11 @@ impl GroupCommandRunner {
       self
         .create_group(&user, workspace_id, object_id, collab_type)
         .await?;
+    } else {
+      // The caller replies with the state of the group: it must belong to the requested workspace.
+      self
+        .ensure_group_workspace(&object_id, &workspace_id)
+        .await?;
     }
 
     // Only subscribe when the user is not subscribed to the group
@@ -265,6 +276,31 @@ impl GroupCommandRunner {
       }
     }
     Ok(())
+  }
+
+  /// Returns an error if the existing group of `object_id` was created for another workspace.
+  async fn ensure_group_workspace(
+    &self,
+    object_id: &Uuid,
+    workspace_id: &Uuid,
+  ) -> Result<(), RealtimeError> {
+    match self.group_manager.get_group(object_id).await {
+      Some(group) if group.workspace_id() != workspace_id => {
+        warn!(
+          "collab {} was requested through workspace {} but its group belongs to workspace {}",
+          object_id,
+          workspace_id,
+          group.workspace_id()
+        );
+        Err(RealtimeError::CreateGroupFailed(
+          CreateGroupFailedReason::CollabWorkspaceIdNotMatch {
+            expect: group.workspace_id().to_string(),
+            detail: format!("collab {} requested through {}", object_id, workspace_id),
+          },
+        ))
+      },
+      _ => Ok(()),
+    }
   }
 
   async fn subscribe_group_with_message(

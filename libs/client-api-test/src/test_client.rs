@@ -977,6 +977,10 @@ impl TestClient {
     comments_enabled: bool,
     duplicate_enabled: bool,
   ) {
+    // Only views of the workspace folder can be published.
+    let view_ids: Vec<Uuid> = data.iter().map(|(view_id, _, _)| *view_id).collect();
+    crate::add_views_to_workspace_folder(&self.api_client, workspace_id, &view_ids).await;
+
     let pub_items = data
       .into_iter()
       .map(|(view_id, meta_json, blob_hex)| {

@@ -218,6 +218,7 @@ async fn test_template_crud() {
     .await
     .unwrap();
   let published_view_ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+  add_views_to_workspace_folder(&authorized_client, &workspace_id, &published_view_ids).await;
   let published_collab_items: Vec<PublishCollabItem<TemplateMetadata, &[u8]>> = published_view_ids
     .iter()
     .map(|view_id| PublishCollabItem {

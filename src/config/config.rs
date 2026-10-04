@@ -28,6 +28,9 @@ pub struct Config {
   pub mailer: MailerSetting,
   pub apple_oauth: AppleOAuthSetting,
   pub appflowy_web_url: String,
+  /// Public URL of this server. When set, it is used instead of the client supplied `X-Host`
+  /// header to build the URLs of imported files.
+  pub appflowy_base_url: Option<String>,
   pub notification: NotificationSetting,
   pub open_ai_config: Option<OpenAIConfig>,
   pub azure_ai_config: Option<AzureConfig>,
@@ -273,6 +276,7 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
     },
     appflowy_web_url: get_env_var_opt("APPFLOWY_WEB_URL")
       .ok_or(anyhow!("APPFLOWY_WEB_URL has not been set"))?,
+    appflowy_base_url: get_env_var_opt("APPFLOWY_BASE_URL"),
     notification: NotificationSetting {
       enable_email_notification: get_env_var("APPFLOWY_NOTIFICATION_ENABLE_EMAIL", "false")
         .parse()?,

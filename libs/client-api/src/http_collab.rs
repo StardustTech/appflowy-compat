@@ -449,6 +449,24 @@ impl Client {
     Ok(info.exists)
   }
 
+  pub async fn check_if_collab_exists(
+    &self,
+    workspace_id: &Uuid,
+    object_id: &Uuid,
+  ) -> Result<bool, AppResponseError> {
+    let url = format!(
+      "{}/api/workspace/{workspace_id}/collab/{object_id}/collab-exists",
+      self.base_url
+    );
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    let info = process_response_data::<AFDatabaseRowDocumentCollabExistenceInfo>(resp).await?;
+    Ok(info.exists)
+  }
+
   pub async fn get_collab_embed_info(
     &self,
     workspace_id: &Uuid,
@@ -543,7 +561,13 @@ impl Client {
       .body(Bytes::from(encoded_payload))
       .send()
       .await?;
-    if resp.status().is_success() {
+    // Errors are returned as JSON with a success status, the collab state as zstd bytes.
+    let is_json = resp
+      .headers()
+      .get(reqwest::header::CONTENT_TYPE)
+      .and_then(|value| value.to_str().ok())
+      .is_some_and(|value| value.starts_with("application/json"));
+    if resp.status().is_success() && !is_json {
       let body = resp.bytes().await?;
       let decompressed_body = zstd::decode_all(Cursor::new(body))?;
       Ok(decompressed_body)

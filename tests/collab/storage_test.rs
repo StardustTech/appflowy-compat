@@ -330,7 +330,8 @@ async fn fail_insert_collab_with_invalid_workspace_id_test() {
     .await
     .unwrap_err();
 
-  assert_eq!(error.code, ErrorCode::RecordNotFound);
+  // The user is not a member of the workspace, which is checked before its existence.
+  assert_eq!(error.code, ErrorCode::NotEnoughPermissions);
 }
 
 #[tokio::test]

@@ -133,21 +133,34 @@ impl CollabManager {
     }
   }
 
+  /// Checks that `object_id` doesn't belong to another workspace and that the user is allowed to
+  /// perform `action` in `workspace_id`. A collab that doesn't exist yet is considered to be part
+  /// of `workspace_id`, so only the workspace permission applies to it.
+  async fn enforce_collab_action(
+    &self,
+    workspace_id: &WorkspaceId,
+    uid: &i64,
+    object_id: &ObjectId,
+    action: Action,
+  ) -> AppResult<()> {
+    self
+      .collab_cache
+      .check_collab_workspace(workspace_id, object_id)
+      .await?;
+    self
+      .access_control
+      .enforce_action(workspace_id, uid, object_id, action)
+      .await
+  }
+
   pub async fn enforce_read_collab(
     &self,
     workspace_id: &WorkspaceId,
     uid: &i64,
     object_id: &ObjectId,
   ) -> AppResult<()> {
-    let collab_exists = self.collab_cache.is_exist(workspace_id, object_id).await?;
-    if !collab_exists {
-      // If the collab does not exist, we should not enforce the access control. We consider the user
-      // has the permission to read the collab
-      return Ok(());
-    }
     self
-      .access_control
-      .enforce_action(workspace_id, uid, object_id, Action::Read)
+      .enforce_collab_action(workspace_id, uid, object_id, Action::Read)
       .await
   }
 
@@ -157,15 +170,8 @@ impl CollabManager {
     uid: &i64,
     object_id: &ObjectId,
   ) -> AppResult<()> {
-    let collab_exists = self.collab_cache.is_exist(workspace_id, object_id).await?;
-    if !collab_exists {
-      // If the collab does not exist, we should not enforce the access control. we consider the user
-      // has the permission to write the collab
-      return Ok(());
-    }
     self
-      .access_control
-      .enforce_action(workspace_id, uid, object_id, Action::Write)
+      .enforce_collab_action(workspace_id, uid, object_id, Action::Write)
       .await
   }
 
@@ -192,16 +198,9 @@ impl CollabManager {
     state_vector: StateVector,
   ) -> AppResult<CollabState> {
     let params = QueryCollab::new(object_id, collab_type);
-    let collab_exists = self
-      .collab_cache
-      .is_exist(&workspace_id, &object_id)
+    self
+      .enforce_read_collab(&workspace_id, &user_id, &object_id)
       .await?;
-    if collab_exists {
-      self
-        .access_control
-        .enforce_action(&workspace_id, &user_id, &object_id, Action::Read)
-        .await?;
-    }
 
     let TimestampedEncodedCollab {
       encoded_collab,
@@ -428,9 +427,22 @@ impl CollabManager {
       };
 
       // Fetch the snapshot from database
-      let (rid, update_snapshot) = self
+      let (rid, update_snapshot) = match self
         .get_snapshot(workspace_id, object_id, collab_type)
-        .await?;
+        .await
+      {
+        Ok(snapshot) => snapshot,
+        Err(AppError::NotEnoughPermissions) => {
+          // The object belongs to another workspace: never persist these updates through this
+          // workspace, as it would overwrite the cached state of the other workspace's object.
+          warn!(
+            "skip snapshot of collab {} in workspace {}: it belongs to another workspace",
+            object_id, workspace_id
+          );
+          continue;
+        },
+        Err(err) => return Err(err.into()),
+      };
 
       snapshot_tasks.push(SnapshotTask {
         workspace_id,

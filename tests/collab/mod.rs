@@ -1,6 +1,7 @@
 mod awareness_test;
 mod collab_curd_test;
 mod collab_embedding_test;
+mod cross_workspace_test;
 mod database_crud;
 mod multi_devices_edit;
 mod permission_test;

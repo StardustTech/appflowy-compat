@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use app_error::ErrorCode;
 use client_api_test::{generate_unique_registered_user_client, workspace_id_from_client};
 use collab_database::entity::FieldType;
+use collab_database::rows::{meta_id_from_row_id, RowMetaKey};
 use serde_json::json;
 use shared_entity::dto::workspace_dto::AFInsertDatabaseField;
 
@@ -344,4 +346,61 @@ async fn database_insert_row_with_doc() {
     row_detail.doc,
     Some("This is a document of a database row".to_string())
   );
+}
+
+#[tokio::test]
+async fn row_document_collab_exists_of_other_workspace_test() {
+  let (alice, _) = generate_unique_registered_user_client().await;
+  let alice_workspace_id = workspace_id_from_client(&alice).await;
+  let databases = alice.list_databases(&alice_workspace_id).await.unwrap();
+  let row_id = alice
+    .upsert_database_item(
+      &alice_workspace_id,
+      &databases[0].id,
+      "row_document_exists".to_string(),
+      HashMap::from([]),
+      Some("Document of alice's row".to_string()),
+    )
+    .await
+    .unwrap();
+  let row_id = uuid::Uuid::parse_str(&row_id).unwrap();
+  let document_id =
+    uuid::Uuid::parse_str(&meta_id_from_row_id(&row_id, RowMetaKey::DocumentId)).unwrap();
+
+  assert!(alice
+    .check_if_row_document_collab_exists(&alice_workspace_id, &row_id)
+    .await
+    .unwrap());
+  assert!(alice
+    .check_if_collab_exists(&alice_workspace_id, &document_id)
+    .await
+    .unwrap());
+  assert!(!alice
+    .check_if_collab_exists(&alice_workspace_id, &uuid::Uuid::new_v4())
+    .await
+    .unwrap());
+
+  // Bob can't learn through his own workspace that the objects of alice's workspace exist.
+  let (bob, _) = generate_unique_registered_user_client().await;
+  let bob_workspace_id = workspace_id_from_client(&bob).await;
+  assert!(!bob
+    .check_if_row_document_collab_exists(&bob_workspace_id, &row_id)
+    .await
+    .unwrap());
+  assert!(!bob
+    .check_if_collab_exists(&bob_workspace_id, &document_id)
+    .await
+    .unwrap());
+
+  // Nor through alice's workspace, of which he is not a member.
+  let err = bob
+    .check_if_row_document_collab_exists(&alice_workspace_id, &row_id)
+    .await
+    .unwrap_err();
+  assert_eq!(err.code, ErrorCode::NotEnoughPermissions, "{:?}", err);
+  let err = bob
+    .check_if_collab_exists(&alice_workspace_id, &document_id)
+    .await
+    .unwrap_err();
+  assert_eq!(err.code, ErrorCode::NotEnoughPermissions, "{:?}", err);
 }
