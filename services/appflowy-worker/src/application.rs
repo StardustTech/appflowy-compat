@@ -39,7 +39,7 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
   dotenvy::dotenv().ok();
   init_subscriber(&config.app_env);
-  info!("config loaded: {:?}", &config);
+  info!(environment = ?config.app_env, "worker configuration loaded");
 
   // Start the server
   info!("Starting server at: {:?}", listener.local_addr());
@@ -182,8 +182,8 @@ async fn get_worker_mailer(config: &Config) -> Result<AFWorkerMailer, Error> {
 
 async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error> {
   info!(
-    "Connecting to postgres database with setting: {:?}",
-    setting
+    max_connections = setting.max_connections,
+    "connecting to worker database"
   );
   PgPoolOptions::new()
     .max_connections(setting.max_connections)
