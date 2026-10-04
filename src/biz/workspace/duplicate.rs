@@ -12,7 +12,7 @@ use collab::core::collab::default_client_id;
 use collab_database::{
   database::{gen_database_id, gen_row_id, timestamp, Database, DatabaseContext, DatabaseData},
   entity::{CreateDatabaseParams, CreateViewParams},
-  rows::CreateRowParams,
+  rows::{meta_id_from_row_id, CreateRowParams, DatabaseRowBody, RowMetaKey},
   views::OrderObjectPosition,
   workspace_database::WorkspaceDatabase,
 };
@@ -29,6 +29,7 @@ use std::{
 };
 use uuid::Uuid;
 use yrs::block::ClientID;
+use yrs::Map;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn duplicate_view_tree_and_collab(
@@ -216,6 +217,37 @@ async fn duplicate_database(
       .map_err(|err| AppError::Internal(anyhow::anyhow!("Failed to open database: {}", err)))?;
     let database_data = database.get_database_data(20, true).await;
     let params = duplicate_database_data_with_context(duplicate_context, &database_data);
+    // Row documents have IDs derived from their row. Copy current content before exposing
+    // the new database, and bind it to the newly allocated row rather than the source row.
+    let mut row_documents = Vec::new();
+    let mut rows_with_documents = HashSet::new();
+    for (source, target) in database_data.rows.iter().zip(&params.rows) {
+      let source_row: Uuid = source.id.to_string().parse()?;
+      let target_row: Uuid = target.id.to_string().parse()?;
+      let source_doc: Uuid = meta_id_from_row_id(&source_row, RowMetaKey::DocumentId).parse()?;
+      let target_doc: Uuid = meta_id_from_row_id(&target_row, RowMetaKey::DocumentId).parse()?;
+      match collab_storage
+        .get_full_encode_collab(
+          GetCollabOrigin::User { uid },
+          &workspace_id,
+          &source_doc,
+          CollabType::Document,
+        )
+        .await
+      {
+        Ok(document) => {
+          row_documents.push(duplicate_document_encoded_collab(
+            &source_doc,
+            target_doc,
+            document.encoded_collab,
+            client_id,
+          )?);
+          rows_with_documents.insert(target_row);
+        },
+        Err(AppError::RecordNotFound(_)) => {},
+        Err(err) => return Err(err),
+      }
+    }
     let duplicated_database = Database::create_with_view(params, database_context.clone())
       .await
       .map_err(|err| {
@@ -235,7 +267,7 @@ async fn duplicate_database(
           err
         ))
       })?;
-    let mut collab_params_list = vec![];
+    let mut collab_params_list = row_documents;
     let database_id = Uuid::parse_str(&duplicated_database.get_database_id())?;
     collab_params_list.push(CollabParams {
       object_id: database_id,
@@ -248,9 +280,28 @@ async fn duplicate_database(
       updated_at: None,
     });
     for row in encoded_database.encoded_row_collabs {
+      let encoded_row = if rows_with_documents.contains(&row.object_id) {
+        let mut collab = collab_from_doc_state(
+          row.encoded_collab.doc_state.to_vec(),
+          &row.object_id,
+          client_id,
+        )?;
+        let body = DatabaseRowBody::open(row.object_id.to_string().into(), &mut collab)
+          .map_err(|err| AppError::Internal(anyhow!("Failed to open copied row: {}", err)))?;
+        body.get_meta().insert(
+          &mut collab.transact_mut(),
+          meta_id_from_row_id(&row.object_id, RowMetaKey::IsDocumentEmpty),
+          false,
+        );
+        collab
+          .encode_collab_v1(|c| CollabType::DatabaseRow.validate_require_data(c))
+          .map_err(|err| AppError::Internal(anyhow!("Failed to encode copied row: {}", err)))?
+      } else {
+        row.encoded_collab
+      };
       collab_params_list.push(CollabParams {
         object_id: row.object_id,
-        encoded_collab_v1: row.encoded_collab.encode_to_bytes()?.into(),
+        encoded_collab_v1: encoded_row.encode_to_bytes()?.into(),
         collab_type: CollabType::DatabaseRow,
         updated_at: None,
       });
