@@ -19,6 +19,8 @@ FROM chef as builder
 # Update package lists and install protobuf-compiler along with other build dependencies
 RUN apt update && apt install -y protobuf-compiler lld clang
 
+# Keep dependency-stage arguments identical to the Cloud Dockerfile for cache reuse.
+ARG FEATURES=""
 ARG PROFILE="release"
 
 COPY --from=planner /app/recipe.json recipe.json
@@ -27,7 +29,7 @@ ARG BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-RUN echo "Building worker with profile: ${PROFILE} "
+RUN echo "Building appflowy cloud with profile: ${PROFILE}"
 RUN if [ "$PROFILE" = "debug" ]; then \
       cargo chef cook --locked --recipe-path recipe.json; \
     else \
