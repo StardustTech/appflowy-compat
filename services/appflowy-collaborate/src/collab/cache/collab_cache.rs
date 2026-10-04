@@ -390,8 +390,12 @@ impl CollabCache {
     };
 
     let from = from.unwrap_or_default();
-    if !self.is_dirty_since(&object_id, MillisSeconds::from(&rid)) {
-      // there are no pending updates for this collab, so we can return the cached value directly
+    // Redis is shared by every writer; the process-local dirty hint cannot prove freshness.
+    let updates = self
+      .get_workspace_updates(workspace_id, Some(&object_id), Some(rid), None)
+      .await?;
+    if updates.is_empty() {
+      // No shared pending updates remain after this snapshot.
       trace!("no pending updates for collab: {}", object_id);
       return match encoded_collab {
         Some(encoded_collab) if encoded_collab.doc_state.len() <= self.small_collab_size => {
@@ -414,10 +418,6 @@ impl CollabCache {
         ))),
       };
     }
-
-    let updates = self
-      .get_workspace_updates(workspace_id, Some(&object_id), Some(rid), None)
-      .await?;
 
     let size = encoded_collab
       .as_ref()
@@ -652,7 +652,7 @@ impl CollabCache {
     results
   }
 
-  /// Batch get the FULL/CURRENT collab data (applying pending updates for dirty collabs).
+  /// Batch get the FULL/CURRENT collab data, including updates from every server.
   /// This function is consistent with get_full_collab - it applies pending updates.
   /// Returns a hashmap of the object_id to the encoded collab data.
   #[instrument(level = "debug", skip_all)]
@@ -666,34 +666,10 @@ impl CollabCache {
     let queries = queries.into_iter().map(Into::into).collect::<Vec<_>>();
     let mut results = HashMap::new();
 
-    // For batch efficiency, separate dirty and clean collabs
-    let mut clean_queries = Vec::new();
-    let mut dirty_queries = Vec::new();
-
-    for query in queries {
-      if self.is_dirty_since(&query.object_id, MillisSeconds::now()) {
-        dirty_queries.push(query);
-      } else {
-        clean_queries.push(query);
-      }
-    }
-
-    debug!(
-      "Batch processing collabs: {} clean, {} dirty",
-      clean_queries.len(),
-      dirty_queries.len()
-    );
-
-    if !clean_queries.is_empty() {
-      let clean_results = self
-        .batch_get_snapshot_collab(workspace_id, clean_queries)
-        .await;
-      results.extend(clean_results);
-    }
-
+    // Current-state batches have the same cross-instance freshness guarantee as single reads.
     let mut encoded_collab_by_object_id: HashMap<Uuid, EncodedCollab> =
-      HashMap::with_capacity(dirty_queries.len());
-    for query in dirty_queries {
+      HashMap::with_capacity(queries.len());
+    for query in queries {
       let object_id = query.object_id;
       match self
         .get_full_collab(workspace_id, query, from.clone(), encoding.clone())
