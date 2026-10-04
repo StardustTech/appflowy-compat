@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM lukemathwalker/cargo-chef:latest-rust-1.86 as chef
+ARG CHEF_IMAGE=lukemathwalker/cargo-chef:latest-rust-1.86
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+FROM ${CHEF_IMAGE} as chef
 
 # Set the initial working directory
 WORKDIR /app
-RUN apt update && apt install lld clang -y
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update && apt-get install -y lld clang
 
 FROM chef as planner
 COPY . .
@@ -20,28 +23,31 @@ ARG PROFILE="release"
 
 COPY --from=planner /app/recipe.json recipe.json
 # Build our project dependencies with optimized settings
-ENV CARGO_BUILD_JOBS=4
+ARG BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 RUN echo "Building worker with profile: ${PROFILE} "
-RUN if [ "$PROFILE" = "release" ]; then \
-      cargo chef cook --release --recipe-path recipe.json; \
+RUN if [ "$PROFILE" = "debug" ]; then \
+      cargo chef cook --locked --recipe-path recipe.json; \
     else \
-      cargo chef cook --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$PROFILE" --recipe-path recipe.json; \
     fi
 
 COPY . .
+ENV SQLX_OFFLINE=true
 
 WORKDIR /app/services/appflowy-worker
-RUN if [ "$PROFILE" = "release" ]; then \
-      cargo build --release --bin appflowy_worker; \
+RUN if [ "$PROFILE" = "debug" ]; then \
+      cargo build --locked --bin appflowy_worker; \
     else \
-      cargo build --bin appflowy_worker; \
+      cargo build --locked --profile "$PROFILE" --bin appflowy_worker; \
     fi
 
-FROM debian:bookworm-slim AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 WORKDIR /app/services/appflowy-worker
-RUN apt-get update -y \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update -y \
     && apt-get install -y --no-install-recommends openssl \
     && apt-get install -y -y ca-certificates \
     # Clean up

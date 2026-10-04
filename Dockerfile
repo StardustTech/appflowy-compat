@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 # Using cargo-chef to manage Rust build cache effectively
-FROM lukemathwalker/cargo-chef:latest-rust-1.86 as chef
+ARG CHEF_IMAGE=lukemathwalker/cargo-chef:latest-rust-1.86
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+FROM ${CHEF_IMAGE} as chef
 
 WORKDIR /app
-RUN apt update && apt install lld clang -y
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update && apt-get install -y lld clang
 
 FROM chef as planner
 COPY . .
@@ -20,15 +23,16 @@ ARG FEATURES=""
 ARG PROFILE="release"
 
 COPY --from=planner /app/recipe.json recipe.json
-ENV CARGO_BUILD_JOBS=4
+ARG BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 # Reduce memory usage during compilation
 RUN echo "Building appflowy cloud with profile: ${PROFILE}"
-RUN if [ "$PROFILE" = "release" ]; then \
-      cargo chef cook --release --recipe-path recipe.json; \
+RUN if [ "$PROFILE" = "debug" ]; then \
+      cargo chef cook --locked --recipe-path recipe.json; \
     else \
-      cargo chef cook --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$PROFILE" --recipe-path recipe.json; \
     fi
 
 COPY . .
@@ -36,15 +40,16 @@ ENV SQLX_OFFLINE true
 
 # Build the project
 RUN echo "Building with profile: ${PROFILE}, features: ${FEATURES}, "
-RUN if [ "$PROFILE" = "release" ]; then \
-      cargo build --release --features "${FEATURES}" --bin appflowy_cloud; \
+RUN if [ "$PROFILE" = "debug" ]; then \
+      cargo build --locked --features "${FEATURES}" --bin appflowy_cloud; \
     else \
-      cargo build --features "${FEATURES}" --bin appflowy_cloud; \
+      cargo build --locked --profile "$PROFILE" --features "${FEATURES}" --bin appflowy_cloud; \
     fi
 
-FROM debian:bookworm-slim AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 WORKDIR /app
-RUN apt-get update -y \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update -y \
   && apt-get install -y --no-install-recommends openssl ca-certificates curl \
   && update-ca-certificates \
   # Clean up

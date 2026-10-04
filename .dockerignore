@@ -1,4 +1,5 @@
 .env
+.git
 .dockerignore
 spec.yaml
 **/target
