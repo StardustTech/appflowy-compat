@@ -20,8 +20,9 @@ use database_entity::file_dto::{
   UploadPartResponse,
 };
 
-use crate::biz::authentication::jwt::UserUuid;
+use crate::biz::authentication::jwt::{OptionalUserUuid, UserUuid};
 use crate::biz::data_import::LimitedPayload;
+use crate::biz::workspace::published_attachment::is_published_attachment;
 use crate::state::AppState;
 use anyhow::anyhow;
 use appflowy_ai_client::client::AppFlowyAIClient;
@@ -298,7 +299,7 @@ async fn put_blob_handler(
   Ok(AppResponse::Ok().into())
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn delete_blob_handler(
   user_uuid: UserUuid,
   state: Data<AppState>,
@@ -320,17 +321,26 @@ async fn delete_blob_handler(
   Ok(AppResponse::Ok().into())
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_blob_v1_handler(
+  user: OptionalUserUuid,
   state: Data<AppState>,
   path: web::Path<BlobPathV1>,
   req: HttpRequest,
 ) -> Result<HttpResponse<BoxBody>> {
   let path = path.into_inner();
+  authorize_blob_read(
+    &state,
+    &user,
+    &path.workspace_id,
+    Some(&path.parent_dir),
+    &path.file_id,
+  )
+  .await?;
   get_blob_by_object_key(state, &path, req).await
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn delete_blob_v1_handler(
   user_uuid: UserUuid,
   state: Data<AppState>,
@@ -350,6 +360,31 @@ async fn delete_blob_v1_handler(
     .map_err(AppResponseError::from)?;
 
   Ok(AppResponse::Ok().into())
+}
+
+async fn authorize_blob_read(
+  state: &AppState,
+  user: &OptionalUserUuid,
+  workspace_id: &Uuid,
+  parent: Option<&str>,
+  file_id: &str,
+) -> Result<(), AppError> {
+  if let Some(uuid) = user.as_uuid() {
+    let uid = state.user_cache.get_user_uid(&uuid).await?;
+    match state
+      .workspace_access_control
+      .enforce_action(&uid, workspace_id, Action::Read)
+      .await
+    {
+      Ok(()) => return Ok(()),
+      Err(AppError::NotEnoughPermissions) => {},
+      Err(err) => return Err(err),
+    }
+  }
+  if is_published_attachment(state, workspace_id, parent, file_id).await? {
+    return Ok(());
+  }
+  Err(AppError::NotEnoughPermissions)
 }
 
 async fn get_blob_by_object_key(
@@ -423,12 +458,12 @@ async fn get_blob_by_object_key(
   match blob_result {
     Ok(blob) => {
       let response = HttpResponse::Ok()
-          .append_header((ETAG, key.e_tag()))
-          .append_header((CONTENT_TYPE, metadata.file_type))
-          .append_header((LAST_MODIFIED, metadata.modified_at.to_rfc2822()))
-          .append_header((CONTENT_LENGTH, blob.len()))
-          .append_header((CACHE_CONTROL, "public, immutable, max-age=31536000"))// 31536000 seconds = 1 year
-          .body(blob);
+        .append_header((ETAG, key.e_tag()))
+        .append_header((CONTENT_TYPE, metadata.file_type))
+        .append_header((LAST_MODIFIED, metadata.modified_at.to_rfc2822()))
+        .append_header((CONTENT_LENGTH, blob.len()))
+        .append_header((CACHE_CONTROL, "private, no-store"))
+        .body(blob);
 
       Ok(response)
     },
@@ -442,22 +477,33 @@ async fn get_blob_by_object_key(
   }
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_blob_handler(
+  user: OptionalUserUuid,
   state: Data<AppState>,
   path: web::Path<BlobPathV0>,
   req: HttpRequest,
 ) -> Result<HttpResponse<BoxBody>> {
   let blob_path = path.into_inner();
+  authorize_blob_read(
+    &state,
+    &user,
+    &blob_path.workspace_id,
+    None,
+    &blob_path.file_id,
+  )
+  .await?;
   get_blob_by_object_key(state, &blob_path, req).await
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_blob_metadata_handler(
+  user: OptionalUserUuid,
   state: Data<AppState>,
   path: web::Path<BlobPathV0>,
 ) -> Result<JsonAppResponse<BlobMetadata>> {
   let path = path.into_inner();
+  authorize_blob_read(&state, &user, &path.workspace_id, None, &path.file_id).await?;
 
   // Get the metadata
   let metadata = state
@@ -476,12 +522,21 @@ async fn get_blob_metadata_handler(
   Ok(Json(AppResponse::Ok().with_data(metadata)))
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_blob_metadata_v1_handler(
+  user: OptionalUserUuid,
   state: Data<AppState>,
   path: web::Path<BlobPathV1>,
 ) -> Result<JsonAppResponse<BlobMetadata>> {
   let path = path.into_inner();
+  authorize_blob_read(
+    &state,
+    &user,
+    &path.workspace_id,
+    Some(&path.parent_dir),
+    &path.file_id,
+  )
+  .await?;
 
   // Get the metadata
   let metadata = state
@@ -500,11 +555,17 @@ async fn get_blob_metadata_v1_handler(
   Ok(Json(AppResponse::Ok().with_data(metadata)))
 }
 
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_workspace_usage_handler(
+  user: UserUuid,
   state: Data<AppState>,
   workspace_id: web::Path<Uuid>,
 ) -> Result<JsonAppResponse<WorkspaceSpaceUsage>> {
+  let uid = state.user_cache.get_user_uid(&user).await?;
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
   let current = get_workspace_usage_size(&state.pg_pool, &workspace_id)
     .await
     .map_err(AppResponseError::from)?;
@@ -515,11 +576,17 @@ async fn get_workspace_usage_handler(
 }
 
 // TODO(nathan): implement pagination
-#[instrument(level = "debug", skip(state), err)]
+#[instrument(level = "debug", skip_all, err)]
 async fn get_all_workspace_blob_metadata_handler(
+  user: UserUuid,
   state: Data<AppState>,
   workspace_id: web::Path<Uuid>,
 ) -> Result<JsonAppResponse<RepeatedBlobMetaData>> {
+  let uid = state.user_cache.get_user_uid(&user).await?;
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
   let metas = get_all_workspace_blob_metadata(&state.pg_pool, &workspace_id)
     .await
     .map_err(AppResponseError::from)?
