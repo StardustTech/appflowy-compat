@@ -28,10 +28,6 @@ use collab_folder::CollabOrigin;
 use database::collab::select_workspace_database_oid;
 use database::collab::CollabStore;
 use database::collab::GetCollabOrigin;
-use database_entity::dto::QueryCollab;
-use database_entity::dto::QueryCollabResult;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -288,44 +284,21 @@ pub async fn batch_get_latest_collab_encoded(
   oid_list: &[Uuid],
   collab_type: CollabType,
 ) -> Result<HashMap<Uuid, EncodedCollab>, AppError> {
-  let uid = match collab_origin {
-    GetCollabOrigin::User { uid } => uid,
-    _ => 0,
-  };
-  let queries: Vec<QueryCollab> = oid_list
-    .iter()
-    .map(|row_id| QueryCollab {
-      object_id: *row_id,
-      collab_type,
-    })
-    .collect();
-  let query_collab_results = collab_storage
-    .batch_get_collab(&uid, workspace_id, queries)
-    .await;
-  let encoded_collabs = tokio::task::spawn_blocking(move || {
-    let collabs: HashMap<_, EncodedCollab> = query_collab_results
-      .into_par_iter()
-      .filter_map(|(oid, query_collab_result)| match query_collab_result {
-        QueryCollabResult::Success { encode_collab_v1 } => {
-          let decoded_result = EncodedCollab::decode_from_bytes(&encode_collab_v1);
-          match decoded_result {
-            Ok(decoded) => Some((oid, decoded)),
-            Err(err) => {
-              tracing::error!("Failed to decode collab for row {}: {}", oid, err);
-              None
-            },
-          }
-        },
-        QueryCollabResult::Failed { error } => {
-          tracing::error!("Failed to get collab: {:?}", error);
-          None
-        },
-      })
-      .collect();
-    collabs
-  })
-  .await?;
-  Ok(encoded_collabs)
+  let mut results = HashMap::with_capacity(oid_list.len());
+  for oid in oid_list {
+    match collab_storage
+      .get_full_encode_collab(collab_origin.clone(), &workspace_id, oid, collab_type)
+      .await
+    {
+      Ok(value) => {
+        results.insert(*oid, value.encoded_collab);
+      },
+      // Row documents are optional until the user first opens them.
+      Err(AppError::RecordNotFound(_)) => {},
+      Err(err) => return Err(err),
+    }
+  }
+  Ok(results)
 }
 
 pub async fn get_latest_collab_workspace_database_body(

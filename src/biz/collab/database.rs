@@ -247,7 +247,7 @@ impl DatabaseCollabReader for PostgresDatabaseCollabService {
       collab_type,
     )
     .await
-    .unwrap()
+    .map_err(|err| DatabaseError::Internal(err.into()))?
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();

@@ -21,7 +21,7 @@ use collab_entity::{CollabType, EncodedCollab};
 use collab_folder::{Folder, RepeatedViewIdentifier, View, ViewIdentifier};
 use collab_rt_entity::user::RealtimeUser;
 use database::collab::{select_workspace_database_oid, CollabStore, GetCollabOrigin};
-use database_entity::dto::{CollabParams, QueryCollab, QueryCollabResult};
+use database_entity::dto::CollabParams;
 use itertools::Itertools;
 use std::{
   collections::{HashMap, HashSet},
@@ -288,40 +288,27 @@ async fn duplicate_document(
   duplicate_context: &DuplicateContext,
   client_id: ClientID,
 ) -> Result<(), AppError> {
-  let queries = duplicate_context
-    .document_view_ids
-    .iter()
-    .map(|id| QueryCollab {
-      object_id: *id,
-      collab_type: CollabType::Document,
-    })
-    .collect();
-  let query_results = collab_storage
-    .batch_get_collab(&uid, workspace_id, queries)
-    .await;
   let mut collab_params_list = vec![];
-  for (collab_id, query_result) in query_results {
-    match query_result {
-      QueryCollabResult::Success { encode_collab_v1 } => {
-        let encoded_collab = EncodedCollab::decode_from_bytes(&encode_collab_v1)
-          .map_err(|err| AppError::Internal(anyhow::anyhow!("Failed to decode collab: {}", err)))?;
-        let new_collab_id = duplicate_context
-          .view_id_mapping
-          .get(&collab_id)
-          .ok_or_else(|| {
-            AppError::Internal(anyhow::anyhow!(
-              "Failed to find new collab id for {}",
-              collab_id
-            ))
-          })?;
-        let new_collab_param =
-          duplicate_document_encoded_collab(&collab_id, *new_collab_id, encoded_collab, client_id)?;
-        collab_params_list.push(new_collab_param);
-      },
-      QueryCollabResult::Failed { error: _ } => {
-        tracing::warn!("Failed to read collab {} during duplication", collab_id);
-      },
-    }
+  for collab_id in &duplicate_context.document_view_ids {
+    let encoded = collab_storage
+      .get_full_encode_collab(
+        GetCollabOrigin::User { uid },
+        &workspace_id,
+        collab_id,
+        CollabType::Document,
+      )
+      .await?
+      .encoded_collab;
+    let new_collab_id = duplicate_context
+      .view_id_mapping
+      .get(collab_id)
+      .ok_or_else(|| AppError::Internal(anyhow!("Missing copy ID for {}", collab_id)))?;
+    collab_params_list.push(duplicate_document_encoded_collab(
+      collab_id,
+      *new_collab_id,
+      encoded,
+      client_id,
+    )?);
   }
   collab_storage
     .batch_insert_new_collab(workspace_id, &uid, collab_params_list)
@@ -423,8 +410,11 @@ fn duplicate_document_encoded_collab(
   client_id: ClientID,
 ) -> Result<CollabParams, AppError> {
   let collab = collab_from_doc_state(encoded_collab.doc_state.to_vec(), orig_object_id, client_id)?;
-  let document = Document::open(collab).unwrap();
-  let data = document.get_document_data().unwrap();
+  let document = Document::open(collab)
+    .map_err(|err| AppError::Internal(anyhow!("Failed to open source document: {}", err)))?;
+  let data = document
+    .get_document_data()
+    .map_err(|err| AppError::Internal(anyhow!("Failed to read source document: {}", err)))?;
   let duplicated_document = Document::create(&new_object_id.to_string(), data, client_id)
     .map_err(|err| AppError::Internal(anyhow::anyhow!("Failed to create document: {}", err)))?;
   let encoded_collab: EncodedCollab = duplicated_document
