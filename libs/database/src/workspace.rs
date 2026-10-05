@@ -1000,7 +1000,7 @@ where
     return Ok(());
   }
 
-  let query = "INSERT INTO public.af_workspace_deleted (workspace_id) SELECT unnest($1::uuid[])";
+  let query = "INSERT INTO public.af_workspace_deleted (workspace_id) SELECT unnest($1::uuid[]) ON CONFLICT (workspace_id) DO NOTHING";
   sqlx::query(query)
     .bind(workspace_ids)
     .execute(executor)

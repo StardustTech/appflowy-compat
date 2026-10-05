@@ -39,6 +39,12 @@ pub async fn delete_user(
   }
 
   info!("admin deleting user: {:?}", user_uuid);
+  // Capture ownership and close independent resources before Auth may cascade it away.
+  let workspace_ids = select_user_owned_workspaces_id(pg_pool, &user_uuid).await?;
+  for workspace_id in &workspace_ids {
+    database::file::neutral::close_workspace(pg_pool, workspace_id).await?;
+  }
+  insert_workspace_ids_to_deleted_table(pg_pool, workspace_ids.clone()).await?;
   let admin_token = gotrue_admin.token().await?;
   gotrue_client
     .admin_delete_user(
@@ -52,13 +58,11 @@ pub async fn delete_user(
     .map_err(AppResponseError::from)?;
 
   // spawn tasks to delete all workspaces owned by the user
-  let workspace_ids = select_user_owned_workspaces_id(pg_pool, &user_uuid).await?;
 
   info!(
     "saving workspaces: {:?} to deleted workspace table",
     workspace_ids
   );
-  insert_workspace_ids_to_deleted_table(pg_pool, workspace_ids.clone()).await?;
 
   let mut tasks = vec![];
   for workspace_id in workspace_ids {
@@ -92,7 +96,7 @@ async fn revoke_apple_user(
         return Err(AppResponseError::new(
           ErrorCode::InvalidRequest,
           "apple email deletion must provide access_token or refresh_token",
-        ))
+        ));
       },
     },
   };

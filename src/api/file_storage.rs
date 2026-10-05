@@ -1,20 +1,19 @@
 use access_control::act::Action;
 use actix_http::body::BoxBody;
 use actix_web::http::header::{
-  ContentLength, ContentType, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
+  CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ContentLength, ContentType, ETAG, IF_MODIFIED_SINCE,
   LAST_MODIFIED,
 };
 use actix_web::web::{Json, Payload};
 use actix_web::{
-  web::{self, Data},
   HttpRequest, ResponseError, Scope,
+  web::{self, Data},
 };
 use actix_web::{HttpResponse, Result};
 use app_error::AppError;
 
 use chrono::DateTime;
 use database::file::BlobKey;
-use database::resource_usage::{get_all_workspace_blob_metadata, get_workspace_usage_size};
 use database_entity::file_dto::{
   CompleteUploadRequest, CreateUploadRequest, CreateUploadResponse, UploadPartData,
   UploadPartResponse,
@@ -392,6 +391,43 @@ async fn get_blob_by_object_key(
   key: &impl BlobKey,
   req: HttpRequest,
 ) -> Result<HttpResponse<BoxBody>> {
+  match state.bucket_storage.neutral_blob(key).await {
+    Ok(Some((metadata, blob))) => {
+      if req
+        .headers()
+        .get(IF_MODIFIED_SINCE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+        .is_some_and(|since| metadata.modified_at.naive_utc() <= since.naive_utc())
+      {
+        return Ok(
+          HttpResponse::NotModified()
+            .append_header((CACHE_CONTROL, "private, no-store"))
+            .finish(),
+        );
+      }
+      return Ok(
+        HttpResponse::Ok()
+          .append_header((ETAG, key.e_tag()))
+          .append_header((CONTENT_TYPE, metadata.file_type))
+          .append_header((LAST_MODIFIED, metadata.modified_at.to_rfc2822()))
+          .append_header((CONTENT_LENGTH, blob.len()))
+          .append_header((CACHE_CONTROL, "private, no-store"))
+          .body(blob),
+      );
+    },
+    Ok(None) => {},
+    Err(err) if err.is_record_not_found() => return Ok(HttpResponse::NotFound().finish()),
+    // Binary consumers decide success from the HTTP status, unlike JSON RPC.
+    // A 200 error envelope would be saved as a corrupt attachment by fixed Web.
+    Err(err) => {
+      return Ok(
+        HttpResponse::ServiceUnavailable()
+          .append_header((CACHE_CONTROL, "private, no-store"))
+          .json(AppResponse::<()>::from(err)),
+      );
+    },
+  }
   // Get the metadata
   let result = state
     .bucket_storage
@@ -566,7 +602,9 @@ async fn get_workspace_usage_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let current = get_workspace_usage_size(&state.pg_pool, &workspace_id)
+  let current = state
+    .bucket_storage
+    .workspace_usage(&workspace_id)
     .await
     .map_err(AppResponseError::from)?;
   let usage = WorkspaceSpaceUsage {
@@ -587,7 +625,9 @@ async fn get_all_workspace_blob_metadata_handler(
     .workspace_access_control
     .enforce_action(&uid, &workspace_id, Action::Read)
     .await?;
-  let metas = get_all_workspace_blob_metadata(&state.pg_pool, &workspace_id)
+  let metas = state
+    .bucket_storage
+    .workspace_metadata(&workspace_id)
     .await
     .map_err(AppResponseError::from)?
     .into_iter()

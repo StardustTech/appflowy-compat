@@ -39,6 +39,8 @@ aws-sdk-s3 = { version = "1.88.0", features = [
 ], optional = true }
 rust_decimal = "1.36.0"
 itertools = "0.12.1"
+reqwest = { workspace = true, features = ["json"] }
+sha2 = "0.10.8"
 
 [features]
 default = ["s3"]

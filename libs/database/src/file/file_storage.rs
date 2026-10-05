@@ -81,10 +81,14 @@ where
   C: BucketClient,
 {
   pub fn new(client: C, pg_pool: PgPool) -> Self {
+    super::neutral::start_reconciler(pg_pool.clone());
     Self { client, pg_pool }
   }
 
   pub async fn remove_dir(&self, dir: &str) -> Result<(), AppError> {
+    if let Ok(ws) = Uuid::parse_str(dir) {
+      super::neutral::close_workspace(&self.pg_pool, &ws).await?;
+    }
     info!("removing dir: {}", dir);
     self.client.remove_dir(dir).await?;
     Ok(())
@@ -99,6 +103,17 @@ where
     file_type: String,
     file_size: usize,
   ) -> Result<(), AppError> {
+    let mut route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), true).await?;
+    route.lock_key(&key.object_key()).await?;
+    if let Some(p) = route.neutral() {
+      let bytes = file_stream
+        .collect()
+        .await
+        .map_err(|_| AppError::InvalidRequest("Invalid attachment stream".into()))?
+        .into_bytes()
+        .to_vec();
+      return p.put(&self.pg_pool, &key, bytes, file_type).await;
+    }
     if is_blob_metadata_exists(&self.pg_pool, key.workspace_id(), &key.blob_metadata_key()).await? {
       warn!(
         "file already exists, workspace_id: {}, blob_metadata_key: {}",
@@ -124,6 +139,11 @@ where
   }
 
   pub async fn delete_blob(&self, key: impl BlobKey) -> Result<(), AppError> {
+    let mut route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), true).await?;
+    route.lock_key(&key.object_key()).await?;
+    if let Some(p) = route.neutral() {
+      return p.delete(&self.pg_pool, &key).await;
+    }
     self.client.delete_blob(&key.object_key()).await?;
 
     let mut tx = self.pg_pool.begin().await?;
@@ -137,11 +157,19 @@ where
     workspace_id: &Uuid,
     metadata_key: &str,
   ) -> Result<AFBlobMetadataRow, AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, workspace_id, false).await?;
+    if let Some(p) = route.neutral() {
+      return p.meta(&self.pg_pool, metadata_key).await;
+    }
     let metadata = get_blob_metadata(&self.pg_pool, workspace_id, metadata_key).await?;
     Ok(metadata)
   }
 
   pub async fn get_blob(&self, key: &impl BlobKey) -> Result<Vec<u8>, AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), false).await?;
+    if let Some(p) = route.neutral() {
+      return p.read(&self.pg_pool, key).await;
+    }
     let blob = self.client.get_blob(&key.object_key()).await?.to_blob();
     Ok(blob)
   }
@@ -151,6 +179,11 @@ where
     key: impl BlobKey,
     req: CreateUploadRequest,
   ) -> Result<CreateUploadResponse, AppError> {
+    let mut route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), true).await?;
+    route.lock_key(&key.object_key()).await?;
+    if let Some(p) = route.neutral() {
+      return p.begin(&self.pg_pool, &key, req).await;
+    }
     self.client.create_upload(&key.object_key(), req).await
   }
 
@@ -159,6 +192,10 @@ where
     key: impl BlobKey,
     req: UploadPartData,
   ) -> Result<UploadPartResponse, AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), true).await?;
+    if let Some(p) = route.neutral() {
+      return p.part(&self.pg_pool, &key, req).await;
+    }
     self.client.upload_part(&key.object_key(), req).await
   }
 
@@ -167,6 +204,10 @@ where
     key: impl BlobKey,
     req: CompleteUploadRequest,
   ) -> Result<(), AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), true).await?;
+    if let Some(p) = route.neutral() {
+      return p.complete(&self.pg_pool, &key, req).await;
+    }
     if is_blob_metadata_exists(&self.pg_pool, key.workspace_id(), &key.object_key()).await? {
       warn!(
         "file already exists, workspace_id: {}, request: {}",
@@ -187,5 +228,36 @@ where
     )
     .await?;
     Ok(())
+  }
+
+  pub async fn workspace_usage(&self, workspace_id: &Uuid) -> Result<u64, AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, workspace_id, false).await?;
+    if let Some(p) = route.neutral() {
+      return p.usage().await;
+    }
+    crate::resource_usage::get_workspace_usage_size(&self.pg_pool, workspace_id).await
+  }
+  pub async fn workspace_metadata(
+    &self,
+    workspace_id: &Uuid,
+  ) -> Result<Vec<AFBlobMetadataRow>, AppError> {
+    let route = super::neutral::Route::load(&self.pg_pool, workspace_id, false).await?;
+    if let Some(p) = route.neutral() {
+      return p.list(&self.pg_pool).await;
+    }
+    crate::resource_usage::get_all_workspace_blob_metadata(&self.pg_pool, workspace_id).await
+  }
+  pub async fn neutral_blob(
+    &self,
+    key: &impl BlobKey,
+  ) -> Result<Option<(AFBlobMetadataRow, Vec<u8>)>, AppError> {
+    let mut route = super::neutral::Route::load(&self.pg_pool, key.workspace_id(), false).await?;
+    route.lock_key(&key.object_key()).await?;
+    if let Some(p) = route.neutral() {
+      let meta = p.meta(&self.pg_pool, &key.blob_metadata_key()).await?;
+      let bytes = p.read(&self.pg_pool, key).await?;
+      return Ok(Some((meta, bytes)));
+    }
+    Ok(None)
   }
 }
